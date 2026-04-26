@@ -1,0 +1,169 @@
+@import "tailwindcss";
+
+@theme {
+  /* Brand — invariant across themes */
+  --color-brand: #47ABFF;
+  --color-brand-hover: #6BBFFF;
+  --color-brand-dark: #041635;
+  --color-brand-50: rgba(71, 171, 255, 0.06);
+  --color-brand-100: rgba(71, 171, 255, 0.12);
+  --color-brand-200: #B3D9FF;
+
+  /* Semantic — RSSI/SNR (thématisés via --t-rssi-*).
+   * Light mode utilise des teintes plus sombres pour rester lisibles
+   * sur fond blanc ; dark mode garde les teintes vives originales. */
+  --color-rssi-good: var(--t-rssi-good);
+  --color-rssi-medium: var(--t-rssi-medium);
+  --color-rssi-bad: var(--t-rssi-bad);
+
+  /* Themed surface/text tokens (resolved via CSS vars) */
+  --color-base: var(--t-base);
+  --color-surface: var(--t-surface);
+  --color-surface-elevated: var(--t-surface-elevated);
+  --color-border: var(--t-border);
+  --color-text-primary: var(--t-text-primary);
+  --color-text-secondary: var(--t-text-secondary);
+  --color-text-muted: var(--t-text-muted);
+  --color-overlay: var(--t-overlay);
+
+  /* Radii */
+  --radius-element: 4px;
+  --radius-card: 8px;
+  --radius-modal: 12px;
+
+  /* Shadows */
+  --shadow-subtle: var(--t-shadow-subtle);
+  --shadow-medium: var(--t-shadow-medium);
+  --shadow-elevated: var(--t-shadow-elevated);
+
+  /* Fonts */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+}
+
+/* ── Light theme (default) ── */
+:root {
+  --t-base: #F8FAFC;
+  --t-surface: #FFFFFF;
+  --t-surface-elevated: #F1F5F9;
+  --t-border: #CBD5E1;
+  --t-text-primary: #0F172A;
+  --t-text-secondary: #475569;
+  --t-text-muted: #94A3B8;
+  --t-overlay: rgba(0, 0, 0, 0.06);
+  --t-shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --t-shadow-medium: 0 4px 8px rgba(0, 0, 0, 0.08);
+  --t-shadow-elevated: 0 8px 24px rgba(0, 0, 0, 0.12);
+  /* Sémantique RSSI : teintes sombres pour rester lisibles sur fond clair.
+   * green-600 / amber-600 / red-600 (Tailwind). */
+  --t-rssi-good: #16A34A;
+  --t-rssi-medium: #D97706;
+  --t-rssi-bad: #DC2626;
+  color-scheme: light;
+}
+
+/* ── Dark theme ── */
+.dark {
+  --t-base: #0F172A;
+  --t-surface: #1E293B;
+  --t-surface-elevated: #334155;
+  --t-border: #475569;
+  --t-text-primary: #F1F5F9;
+  --t-text-secondary: #94A3B8;
+  --t-text-muted: #64748B;
+  --t-overlay: rgba(255, 255, 255, 0.06);
+  --t-shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --t-shadow-medium: 0 4px 8px rgba(0, 0, 0, 0.4);
+  --t-shadow-elevated: 0 8px 24px rgba(0, 0, 0, 0.5);
+  /* Sémantique RSSI : teintes vives pour fond sombre.
+   * green-400 / amber-400 / red-400 (Tailwind). */
+  --t-rssi-good: #4ADE80;
+  --t-rssi-medium: #FBBF24;
+  --t-rssi-bad: #F87171;
+  color-scheme: dark;
+}
+
+/* Base styles */
+body {
+  font-family: var(--font-sans);
+  background: var(--color-base);
+  color: var(--color-text-primary);
+  font-size: 14px;
+  line-height: 1.43;
+  overflow: hidden;
+  height: 100vh;
+  margin: 0;
+  transition: background-color 0.2s, color 0.2s;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* Input/select color-scheme follows theme */
+input, select {
+  color-scheme: inherit;
+}
+
+/* Toast animations */
+@keyframes toast-slide-in {
+  from { transform: translateX(calc(100% + 24px)); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+@keyframes toast-fade-out {
+  from { opacity: 1; transform: translateX(0); }
+  to { opacity: 0; transform: translateX(24px); }
+}
+
+/* DetailPanel animations */
+@keyframes detail-slide-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes detail-slide-out {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(8px); }
+}
+
+/* Modal animations */
+@keyframes modal-overlay-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes modal-overlay-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes modal-content-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes modal-content-out {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(0.95); }
+}
+
+/* SourceSelector dropdown */
+@keyframes dropdown-in {
+  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes dropdown-out {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to   { opacity: 0; transform: translateY(-4px) scale(0.98); }
+}
