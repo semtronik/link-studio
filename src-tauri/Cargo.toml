@@ -1,6 +1,6 @@
 [package]
 name = "lft-app"
-version = "1.0.0"
+version = "1.0.1"
 description = "Desktop companion app for the LoRa Field Toolkit (LFT)"
 authors = ["Semtronik <contact@semtronik.com>"]
 license = "MIT"
