@@ -230,6 +230,26 @@ fn run_loop(
 /// cachés. Retourne la liste enrichie et un flag `scanning` (toujours
 /// false en sortie — le spinner côté UI se pilote via `trigger_refresh`
 /// si on veut l'afficher pendant le scan, pas encore implémenté).
+/// Enrichit une liste énumérée sans ouvrir aucun port : on ne fait que
+/// rapatrier le firmware des ports déjà identifiés (`Success`) depuis le
+/// cache. Utilisé pendant le gel du scanner (session série active), où
+/// tout probe est interdit pour ne pas entrer en collision avec une autre
+/// application. Les ports inconnus restent tels quels (non identifiés).
+fn enrich_from_cache_only(
+    ports: Vec<PortInfo>,
+    cache: &HashMap<String, ProbeCacheEntry>,
+) -> Vec<PortInfo> {
+    ports
+        .into_iter()
+        .map(|mut port| {
+            if let Some(ProbeCacheEntry::Success(info)) = cache.get(&cache_key(&port)) {
+                port.firmware = Some(info.clone());
+            }
+            port
+        })
+        .collect()
+}
+
 fn scan_once(
     cache: &mut HashMap<String, ProbeCacheEntry>,
     serial: &Arc<Mutex<SerialManager>>,
@@ -258,6 +278,30 @@ fn scan_once(
         let present: std::collections::HashSet<String> =
             ports.iter().map(cache_key).collect();
         cache.retain(|k, _| present.contains(k));
+    }
+
+    // Gel des probes tant qu'une session série est active. Dès que le
+    // SerialManager est connecté (ou en cours de connexion) à un device,
+    // `busy_path()` est `Some` : on n'a plus besoin de chercher d'autres
+    // ports, et surtout on ne doit ouvrir AUCUN port — sinon le scanner
+    // entre en collision avec une autre application qui flashe un second
+    // ESP (esptool ouvre le port par à-coups, os error 121 des deux côtés).
+    //
+    // On continue malgré tout d'énumérer (métadonnées USB, sans ouverture)
+    // pour que le dropdown reste vivant : un device branché pendant la
+    // session apparaît, simplement sans identification firmware (on ne
+    // peut pas la faire sans ouvrir le port). Les ports déjà identifiés
+    // avant la connexion restent étiquetés via le cache `Success`.
+    //
+    // Le dégel est automatique : à la déconnexion (volontaire ou perte
+    // physique), `busy_path()` repasse à `None` et le scan reprend au tick
+    // suivant — pas de wiring supplémentaire côté `serial_disconnect`.
+    let connected = {
+        let guard = serial.lock().unwrap_or_else(|p| p.into_inner());
+        guard.busy_path().is_some()
+    };
+    if connected {
+        return (enrich_from_cache_only(ports, cache), false);
     }
 
     let mut enriched = Vec::with_capacity(ports.len());
@@ -767,6 +811,53 @@ mod tests {
     fn pace_interval_values() {
         assert_eq!(ScanPace::Active.interval(), Duration::from_millis(2000));
         assert_eq!(ScanPace::Idle.interval(), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn enrich_from_cache_reuses_success_without_probe() {
+        // Session active (scanner gelé) : un port déjà identifié doit
+        // ressortir avec son firmware repris du cache `Success`, sans
+        // qu'aucune ouverture de port ne soit nécessaire.
+        let port = make_port();
+        let info = PortFirmwareInfo {
+            profile: FirmwareProfile::LftV1,
+            product: Some("LFT".into()),
+            model: Some("v1".into()),
+            version: Some("0.2.3".into()),
+            mac: None,
+        };
+        let mut cache = HashMap::new();
+        cache.insert(cache_key(&port), ProbeCacheEntry::Success(info.clone()));
+
+        let out = enrich_from_cache_only(vec![port], &cache);
+        assert_eq!(out.len(), 1);
+        assert!(firmware_eq(out[0].firmware.as_ref(), Some(&info)));
+    }
+
+    #[test]
+    fn enrich_from_cache_leaves_unknown_ports_untouched() {
+        // Pendant le gel, un port absent du cache (jamais identifié, ou
+        // en `Retrying`/`Failure`) ressort tel quel : pas de firmware, pas
+        // de flag modifié — on ne l'ouvre pas pour l'identifier.
+        let port = make_port();
+        let cache = HashMap::new();
+        let out = enrich_from_cache_only(vec![port.clone()], &cache);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].firmware.is_none());
+        assert_eq!(out[0].path, port.path);
+    }
+
+    #[test]
+    fn busy_path_drives_freeze_decision() {
+        // Le gel est piloté par `busy_path()` du SerialManager : `None`
+        // quand libre (scan normal), `Some` dès qu'on amorce une connexion
+        // (gel). Garantit que le scanner cesse tout probe en session.
+        let mut mgr = SerialManager::new();
+        assert!(mgr.busy_path().is_none());
+        mgr.begin_connecting("COM3");
+        assert_eq!(mgr.busy_path(), Some("COM3"));
+        mgr.end_connecting();
+        assert!(mgr.busy_path().is_none());
     }
 
     #[test]
