@@ -128,16 +128,14 @@ input, select {
   to { opacity: 0; transform: translateX(24px); }
 }
 
-/* DetailPanel animations */
+/* DetailPanel — le panneau est monte en permanence sous la liste.
+   L'animation ne joue plus a l'ouverture/fermeture mais a chaque
+   changement de trame selectionnee. */
 @keyframes detail-slide-in {
-  from { opacity: 0; transform: translateY(8px); }
+  from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: translateY(0); }
 }
 
-@keyframes detail-slide-out {
-  from { opacity: 1; transform: translateY(0); }
-  to { opacity: 0; transform: translateY(8px); }
-}
 
 /* Modal animations */
 @keyframes modal-overlay-in {

@@ -25,10 +25,26 @@ interface HexColorizedProps {
   highlightedField?: string | null;
   onHighlightField?: (fieldName: string | null) => void;
   showLegend?: boolean;
+  /* Mode ligne unique : pas de retour a la ligne, et le payload est
+   * coupe a maxBytes octets. Utilise dans le tableau de trames, ou une
+   * trame de 255 octets ne doit ni faire grandir sa ligne ni generer
+   * 255 spans par trame. Le panneau de detail garde le rendu complet
+   * multi-lignes par defaut. */
+  singleLine?: boolean;
+  /* Nombre d'octets rendus au maximum. Au-dela, la suite est remplacee
+   * par un marqueur d'ellipse. La taille exacte reste lisible dans la
+   * colonne OCTETS du tableau. */
+  maxBytes?: number;
 }
 
-export function HexColorized({ hex, fields, highlightedField, onHighlightField, showLegend }: HexColorizedProps) {
-  const bytes = useMemo(() => hex.match(/.{1,2}/g) || [], [hex]);
+export function HexColorized({ hex, fields, highlightedField, onHighlightField, showLegend, singleLine, maxBytes }: HexColorizedProps) {
+  /* La coupe est faite ici plutot que masquee en CSS : une trame de 255
+   * octets ne doit pas generer 255 spans par ligne de tableau. L'appelant
+   * signale lui-meme le reste tronque (cf. FrameTable). */
+  const bytes = useMemo(() => {
+    const all = hex.match(/.{1,2}/g) || [];
+    return maxBytes != null && all.length > maxBytes ? all.slice(0, maxBytes) : all;
+  }, [hex, maxBytes]);
 
   // Map byte index -> { color, fieldName }
   const byteInfo = useMemo(() => {
@@ -80,8 +96,14 @@ export function HexColorized({ hex, fields, highlightedField, onHighlightField, 
   };
 
   return (
-    <div>
-      <span className="font-mono text-[13px] leading-[1.8] inline-flex flex-wrap gap-0.5">
+    <div className={singleLine ? 'min-w-0' : undefined}>
+      <span
+        className={`font-mono text-[13px] leading-[1.8] gap-0.5 ${
+          singleLine
+            ? 'flex flex-nowrap whitespace-nowrap'
+            : 'inline-flex flex-wrap'
+        }`}
+      >
         {groups.map((group, idx) => {
           const isHighlighted = highlightedField != null && group.fieldName === highlightedField;
           const colorEntry = group.color ? COLOR_MAP[group.color] : null;
@@ -92,7 +114,9 @@ export function HexColorized({ hex, fields, highlightedField, onHighlightField, 
           return (
             <span
               key={idx}
-              className={`rounded px-0.5 cursor-pointer transition-all duration-200 hover:scale-105 ${className}`}
+              className={`rounded px-0.5 cursor-pointer transition-all duration-200 ${
+                singleLine ? 'flex-shrink-0' : 'hover:scale-105'
+              } ${className}`}
               onClick={() => handleGroupClick(group.fieldName)}
               title={group.fieldName || undefined}
             >

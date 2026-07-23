@@ -17,8 +17,6 @@ export function FrameViewer() {
   const { frames, paused, annotations, metrics, addFrame, replaceFrames, clearFrames, setPaused, setAnnotations, setMetrics } = useFrameContext();
   const { parserInfo, parserError, decodeFrame, analyzeFrames, importParser, loadRawParser } = useParser();
   const [selectedFrame, setSelectedFrame] = useState<DecodedFrame | null>(null);
-  const [displayedFrame, setDisplayedFrame] = useState<DecodedFrame | null>(null);
-  const [detailVisible, setDetailVisible] = useState(false);
 
   // Run analyze when frames change (debounced)
   useEffect(() => {
@@ -47,22 +45,23 @@ export function FrameViewer() {
   }, [frames, parserInfo?.hasAnalyze, analyzeFrames]);
 
   const decodeAndAdd = useCallback(async (frame: FrameData) => {
-    // Horodatage PC (secondes Unix) — le timestamp device est gardé de côté :
-    // const deviceTimestamp = frame.timestamp;
-    const pcTimestamp = Date.now() / 1000;
+    // Horodatage du boitier (secondes Unix). Le backend Rust a deja arbitre :
+    // timestamp device sur firmware LFT V1 (RTC hardware + settimeofday au
+    // boot), horodatage PC a la reception sur firmware legacy.
+    const timestamp = frame.timestamp;
 
     const decodedFrame: DecodedFrame = {
       id: frame.id,
       type: frame.type as 'frame',
       hex: frame.hex,
-      timestamp: pcTimestamp,
+      timestamp,
       rssi: frame.rssi ?? undefined,
       snr: frame.snr ?? undefined,
     };
 
     try {
       const result = await decodeFrame(frame.id, frame.hex, {
-        timestamp: pcTimestamp,
+        timestamp,
         rssi: frame.rssi ?? undefined,
         snr: frame.snr ?? undefined,
       });
@@ -122,23 +121,6 @@ export function FrameViewer() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parserInfo, decodeFrame]);
 
-  // Animation lifecycle: selectedFrame drives intent, displayedFrame drives rendering
-  useEffect(() => {
-    if (selectedFrame) {
-      setDisplayedFrame(selectedFrame);
-      setDetailVisible(true);
-    } else {
-      // Trigger slide-out; displayedFrame stays until animation ends
-      setDetailVisible(false);
-    }
-  }, [selectedFrame]);
-
-  const handleAnimationEnd = () => {
-    if (!detailVisible) {
-      setDisplayedFrame(null);
-    }
-  };
-
   const handleClear = () => {
     clearFrames();
     setSelectedFrame(null);
@@ -168,13 +150,16 @@ export function FrameViewer() {
 
   return (
     <div className="flex flex-col h-full gap-4">
-      {/* Header */}
-      <div className="flex justify-between items-center flex-shrink-0">
-        <h2 className="text-[13px] font-medium text-text-secondary uppercase tracking-wider">
+      {/* Header — `flex-wrap` : en fenetre etroite la barre passe a la ligne
+        * au lieu de comprimer ses elements jusqu'a couper les libelles.
+        * Chaque bloc porte `whitespace-nowrap` pour ne jamais se casser en
+        * son milieu ("Importer .js" sur deux lignes, etc.). */}
+      <div className="flex flex-wrap justify-between items-center gap-y-2 gap-x-4 flex-shrink-0">
+        <h2 className="text-[13px] font-medium text-text-secondary uppercase tracking-wider whitespace-nowrap">
           Trames capturees <span className="text-brand font-mono">({frames.length})</span>
         </h2>
 
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <ParserSelector
             parserInfo={parserInfo}
             parserError={parserError}
@@ -185,14 +170,14 @@ export function FrameViewer() {
           <button
             onClick={handleExport}
             disabled={frames.length === 0}
-            className="px-3 py-1 rounded-element text-sm font-medium transition-all duration-200 bg-overlay text-text-secondary hover:bg-brand/10 hover:text-brand disabled:opacity-40 disabled:cursor-not-allowed"
+            className="px-3 py-1 rounded-element text-sm font-medium whitespace-nowrap transition-all duration-200 bg-overlay text-text-secondary hover:bg-brand/10 hover:text-brand disabled:opacity-40 disabled:cursor-not-allowed"
           >
             Exporter
           </button>
 
           <button
             onClick={() => setPaused(!paused)}
-            className={`px-3 py-1 rounded-element text-sm font-medium transition-all duration-200 ${
+            className={`px-3 py-1 rounded-element text-sm font-medium whitespace-nowrap transition-all duration-200 ${
               paused ? 'bg-rssi-good/20 text-rssi-good' : 'bg-overlay text-text-secondary'
             }`}
           >
@@ -201,7 +186,7 @@ export function FrameViewer() {
 
           <button
             onClick={handleClear}
-            className="px-3 py-1 bg-rssi-bad/10 text-rssi-bad rounded-element text-sm font-medium hover:bg-rssi-bad/20 transition-all duration-200"
+            className="px-3 py-1 bg-rssi-bad/10 text-rssi-bad rounded-element text-sm font-medium whitespace-nowrap hover:bg-rssi-bad/20 transition-all duration-200"
           >
             Effacer
           </button>
@@ -211,32 +196,38 @@ export function FrameViewer() {
       {/* Metrics banner */}
       {metrics.length > 0 && <MetricsBanner metrics={metrics} />}
 
-      {/* Frame table or empty placeholder */}
-      {frames.length === 0 ? (
-        <div className="flex-1 flex items-center justify-center">
-          <div className="text-center">
-            <p className="text-sm text-text-muted">Aucune trame</p>
-            <p className="text-[12px] text-text-muted mt-1">Connectez un appareil ou chargez une capture</p>
-          </div>
-        </div>
-      ) : (
-        <FrameTable
-          frames={frames}
-          annotations={annotations}
-          selectedFrameId={selectedFrame?.id ?? null}
-          onSelectFrame={setSelectedFrame}
-        />
-      )}
+      {/* Disposition adaptative : cote a cote quand la place le permet,
+        * empilee sinon. Le seuil porte sur la largeur du conteneur (@container)
+        * et non sur celle de la fenetre : c'est la place restante apres le
+        * menu lateral qui decide, pas la taille de l'ecran.
+        * Le detail est toujours monte dans les deux cas : rien ne se decale
+        * au clic sur une trame. */}
+      {/* Le @container ne peut pas se cibler lui-meme : il declare le
+        * contexte, et c'est l'enfant qui porte les variantes @[820px]. */}
+      <div className="@container flex-1 min-h-0">
+        <div className="h-full flex flex-col @[1140px]:flex-row gap-4 min-h-0">
+          {frames.length === 0 ? (
+            <div className="flex-1 flex items-center justify-center">
+              <div className="text-center">
+                <p className="text-sm text-text-muted">Aucune trame</p>
+                <p className="text-[12px] text-text-muted mt-1">Connectez un appareil ou chargez une capture</p>
+              </div>
+            </div>
+          ) : (
+            <FrameTable
+              frames={frames}
+              annotations={annotations}
+              selectedFrameId={selectedFrame?.id ?? null}
+              onSelectFrame={setSelectedFrame}
+            />
+          )}
 
-      {/* Detail panel */}
-      {displayedFrame && (
-        <DetailPanel
-          frame={displayedFrame}
-          annotation={annotations[displayedFrame.id]}
-          visible={detailVisible}
-          onAnimationEnd={handleAnimationEnd}
-        />
-      )}
+          <DetailPanel
+            frame={selectedFrame}
+            annotation={selectedFrame ? annotations[selectedFrame.id] : undefined}
+          />
+        </div>
+      </div>
     </div>
   );
 }

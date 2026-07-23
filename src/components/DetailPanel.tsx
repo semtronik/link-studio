@@ -3,10 +3,11 @@ import { HexColorized } from './HexColorized';
 import type { DecodedFrame, Field, Annotation } from '../types/parser';
 
 interface DetailPanelProps {
-  frame: DecodedFrame;
+  /* null = aucune trame selectionnee. Le panneau reste monte et affiche
+   * un etat vide : sa largeur est reservee en permanence pour que le
+   * tableau ne soit pas redimensionne a chaque selection. */
+  frame: DecodedFrame | null;
   annotation?: Annotation;
-  visible: boolean;
-  onAnimationEnd?: () => void;
 }
 
 const ANNOTATION_BADGE: Record<Annotation['status'], string> = {
@@ -52,18 +53,51 @@ function ParsedFieldsGrid({ fields, highlightedField, onHighlightField }: {
   );
 }
 
-export function DetailPanel({ frame, annotation, visible, onAnimationEnd }: DetailPanelProps) {
+/* Empile sous la liste : hauteur fixe, pleine largeur. Cote a cote
+ * (conteneur >= 1140px, soit la largeur qu'il faut pour afficher toutes
+ * les colonnes du tableau ET le panneau) : hauteur alignee sur la liste,
+ * largeur a 40% du conteneur, bornee entre 420 et 640px. Le plafond est
+ * volontaire : au-dela de ~24 octets par ligne, un dump hexa devient plus
+ * difficile a parcourir, pas plus lisible. Le plancher garantit une ligne
+ * exploitable (~16 octets).
+ * Dans les deux cas la zone est reservee en permanence, y compris sans
+ * selection — la liste ne se redimensionne jamais au clic.
+ * Le seuil doit rester identique a celui de FrameViewer. */
+const PANEL_CLASSES =
+  'h-[260px] @[1140px]:h-auto @[1140px]:w-[40%] @[1140px]:min-w-[420px] @[1140px]:max-w-[640px] flex-shrink-0 overflow-y-auto bg-surface rounded-card border border-[rgba(255,255,255,0.04)] shadow-subtle p-4';
+
+export function DetailPanel({ frame, annotation }: DetailPanelProps) {
   const [highlightedField, setHighlightedField] = useState<string | null>(null);
+
+  if (!frame) {
+    return (
+      <div className={`${PANEL_CLASSES} flex items-center justify-center`}>
+        <p className="text-[12px] text-text-muted text-center">
+          Selectionnez une trame<br />pour voir son detail
+        </p>
+      </div>
+    );
+  }
+
   const fields = frame.decoded?.fields || [];
 
-  const animationClass = visible
-    ? 'animate-[detail-slide-in_300ms_ease-out]'
-    : 'animate-[detail-slide-out_200ms_ease-out_forwards]';
+  /* Un champ qui couvre tout le payload et se contente d'en repeter les
+   * octets n'ajoute rien au bloc hexa colorise juste au-dessus — c'est le
+   * cas du champ unique "Data" du parseur Raw. On l'ecarte de la liste
+   * pour ne pas afficher deux fois le meme dump. */
+  const byteCount = frame.hex.length / 2;
+  const listedFields = fields.filter(field => {
+    const [start, end] = field.bytes;
+    const coversAll = start === 0 && end >= byteCount;
+    if (!coversAll) return true;
+    const normalized = String(field.value).replace(/[\s:]/g, '').toUpperCase();
+    return normalized !== frame.hex.toUpperCase();
+  });
 
   return (
     <div
-      className={`bg-surface rounded-card border border-[rgba(255,255,255,0.04)] shadow-subtle p-4 ${animationClass}`}
-      onAnimationEnd={() => { if (!visible) onAnimationEnd?.(); }}
+      key={frame.id}
+      className={`${PANEL_CLASSES} animate-[detail-slide-in_200ms_ease-out]`}
     >
       <div className="flex items-center gap-3 mb-3">
         <h3 className="text-[13px] font-medium text-text-secondary uppercase tracking-wider">
@@ -82,9 +116,11 @@ export function DetailPanel({ frame, annotation, visible, onAnimationEnd }: Deta
         </div>
       )}
 
-      <div className="flex gap-6">
-        {/* Left: Hex colorized with legend */}
-        <div className="flex-1">
+      {/* Empile sous la liste, le panneau est large mais bas : hex et champs
+        * cote a cote. En colonne de droite il est etroit et haut : ils
+        * s'empilent. Le seuil est celui de la disposition generale. */}
+      <div className="flex gap-6 @[1140px]:flex-col @[1140px]:gap-4">
+        <div className="flex-1 min-w-0 @[1140px]:flex-none">
           <HexColorized
             hex={frame.hex}
             fields={fields}
@@ -94,11 +130,12 @@ export function DetailPanel({ frame, annotation, visible, onAnimationEnd }: Deta
           />
         </div>
 
-        {/* Right: Parsed fields grid */}
-        {fields.length > 0 && (
-          <div className="flex-1">
+        {listedFields.length > 0 && (
+          /* Le filet ne separe qu'en mode empile : cote a cote, l'ecart
+            * horizontal suffit. */
+          <div className="flex-1 min-w-0 @[1140px]:flex-none @[1140px]:pt-4 @[1140px]:border-t @[1140px]:border-[rgba(255,255,255,0.06)]">
             <ParsedFieldsGrid
-              fields={fields}
+              fields={listedFields}
               highlightedField={highlightedField}
               onHighlightField={setHighlightedField}
             />
