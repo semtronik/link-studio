@@ -3,6 +3,7 @@ import { useSerialContext } from '../contexts/SerialContext';
 import { useFrameContext } from '../contexts/FrameContext';
 import { useParser } from '../hooks/useParser';
 import { FrameTable } from './FrameTable';
+import { FrameTimeline } from './FrameTimeline';
 import { DetailPanel } from './DetailPanel';
 import { ParserSelector } from './ParserSelector';
 import { MetricsBanner } from './MetricsBanner';
@@ -13,7 +14,7 @@ import { save } from '@tauri-apps/plugin-dialog';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
 
 export function FrameViewer() {
-  const { connected, onFrame } = useSerialContext();
+  const { connected, config, onFrame } = useSerialContext();
   const { frames, paused, annotations, metrics, addFrame, replaceFrames, clearFrames, setPaused, setAnnotations, setMetrics } = useFrameContext();
   const { parserInfo, parserError, decodeFrame, analyzeFrames, importParser, loadRawParser } = useParser();
   const [selectedFrame, setSelectedFrame] = useState<DecodedFrame | null>(null);
@@ -138,6 +139,9 @@ export function FrameViewer() {
     if (!filePath) return;
 
     const capture: CaptureFile = {
+      // Sans config, une capture rechargee ne peut pas recalculer le Time
+      // on Air : la timeline retomberait a des barres de largeur minimale.
+      config: config ?? undefined,
       frames: frames.map(f => ({
         timestamp: f.timestamp,
         rssi: f.rssi,
@@ -196,35 +200,32 @@ export function FrameViewer() {
       {/* Metrics banner */}
       {metrics.length > 0 && <MetricsBanner metrics={metrics} />}
 
-      {/* Disposition adaptative : cote a cote quand la place le permet,
-        * empilee sinon. Le seuil porte sur la largeur du conteneur (@container)
-        * et non sur celle de la fenetre : c'est la place restante apres le
-        * menu lateral qui decide, pas la taille de l'ecran.
-        * Le detail est toujours monte dans les deux cas : rien ne se decale
-        * au clic sur une trame. */}
-      {/* Le @container ne peut pas se cibler lui-meme : il declare le
-        * contexte, et c'est l'enfant qui porte les variantes @[820px]. */}
+      {/* Cote a cote si la place le permet, empile sinon. Le seuil porte sur
+        * le conteneur, qui ne peut pas se cibler lui-meme : d'ou l'enfant. */}
       <div className="@container flex-1 min-h-0">
         <div className="h-full flex flex-col @[1140px]:flex-row gap-4 min-h-0">
-          {frames.length === 0 ? (
-            <div className="flex-1 flex items-center justify-center">
-              <div className="text-center">
-                <p className="text-sm text-text-muted">Aucune trame</p>
-                <p className="text-[12px] text-text-muted mt-1">Connectez un appareil ou chargez une capture</p>
-              </div>
-            </div>
-          ) : (
+          <div className="flex-1 flex flex-col gap-4 h-full min-h-0 min-w-0 overflow-hidden">
             <FrameTable
               frames={frames}
               annotations={annotations}
               selectedFrameId={selectedFrame?.id ?? null}
               onSelectFrame={setSelectedFrame}
             />
-          )}
+
+            <FrameTimeline
+              frames={frames}
+              selectedFrameId={selectedFrame?.id ?? null}
+              onSelectFrame={setSelectedFrame}
+              sf={config?.sf}
+              bw={config?.bw}
+            />
+          </div>
 
           <DetailPanel
             frame={selectedFrame}
             annotation={selectedFrame ? annotations[selectedFrame.id] : undefined}
+            sf={config?.sf}
+            bw={config?.bw}
           />
         </div>
       </div>

@@ -1,0 +1,659 @@
+import { useRef, useEffect, useCallback, useMemo, useState } from 'react';
+import type { DecodedFrame } from '../types/parser';
+import { computeToaMs } from '../utils/loraToa';
+
+interface FrameTimelineProps {
+  frames: DecodedFrame[];
+  selectedFrameId: string | null;
+  onSelectFrame: (frame: DecodedFrame) => void;
+  /* Config radio courante, pour le calcul du Time on Air. Absente tant
+   * qu'aucun appareil n'est connecte : les trames sont alors dessinees a
+   * largeur minimale. */
+  sf?: number;
+  bw?: number;
+}
+
+/* Largeur minimale d'une trame en pixels. Dezoome, un ToA de quelques
+ * dizaines de ms tombe sous le pixel et la trame disparaitrait. */
+const MIN_FRAME_PX = 2;
+
+/* Tolerance de saisie d'un curseur, en pixels de part et d'autre. */
+const CURSOR_GRAB_PX = 7;
+
+/* Distance en pixels sous laquelle un curseur en cours de deplacement
+ * s'aimante au bord de trame (debut ou fin) le plus proche. */
+const SNAP_PX = 8;
+
+/* Bornes de la hauteur des barres, en fraction de la zone de dessin. La
+ * hauteur code la taille du payload : une trame de 6 octets et une de
+ * 199 doivent se distinguer sans lire la table. */
+const BAR_MIN_RATIO = 0.15;
+const BAR_MAX_RATIO = 1;
+const BAR_FULL_SCALE_BYTES = 255;
+
+/* Hauteur de la zone de dessin. Reglable par l'utilisateur : il n'existe
+ * pas de bonne valeur en soi, l'arbitrage table / timeline depend de ce
+ * qu'on est en train de faire (balayer une capture ou comparer des
+ * payloads) et change en cours de session. */
+const TIMELINE_HEIGHT_KEY = 'lft.timeline.height';
+const HEIGHT_MIN = 100;
+const HEIGHT_DEFAULT = 140;
+/* Hauteur minimale laissee a la table au-dessus. Doit rester coherente
+ * avec le `min-h` de FrameTable : en deca, sa zone se replierait sur
+ * elle-meme et son cadre se confondrait avec celui de la timeline. */
+const TABLE_MIN_HEIGHT = 120;
+
+function loadStoredHeight(): number {
+  const raw = localStorage.getItem(TIMELINE_HEIGHT_KEY);
+  const parsed = raw != null ? Number(raw) : NaN;
+  return Number.isFinite(parsed) ? Math.max(HEIGHT_MIN, parsed) : HEIGHT_DEFAULT;
+}
+
+/* ============================================================
+ * Timeline des trames — echelle temporelle reelle
+ *
+ * Chaque trame est un tick vertical positionne selon son horodatage, et
+ * NON selon son rang : c'est ce qui rend visibles les rafales (ticks
+ * tasses) et les silences (vides), l'information qu'on cherche quand on
+ * analyse des delais. Une echelle par rang afficherait des ecarts
+ * reguliers et perdrait exactement ce qu'on veut voir.
+ *
+ * Consequence : sur une capture longue avec une rafale courte, la rafale
+ * est un trait unique a l'echelle globale — d'ou le zoom (molette) et le
+ * pan (glisser), indispensables et non optionnels ici.
+ * ============================================================ */
+
+/* Seuils RSSI alignes sur StatusIndicator — la lecture des couleurs doit
+ * etre identique dans toute l'app. */
+const RSSI_GOOD = -80;
+const RSSI_MEDIUM = -100;
+
+const COLOR_GOOD = '#4ADE80';
+const COLOR_MEDIUM = '#FBBF24';
+const COLOR_BAD = '#F87171';
+const COLOR_UNKNOWN = '#64748B';
+
+function rssiColor(rssi?: number): string {
+  if (rssi == null) return COLOR_UNKNOWN;
+  if (rssi > RSSI_GOOD) return COLOR_GOOD;
+  if (rssi > RSSI_MEDIUM) return COLOR_MEDIUM;
+  return COLOR_BAD;
+}
+
+const AXIS_HEIGHT = 28;
+const AXIS_FONT_PX = 14;
+const TICK_HIT_RADIUS = 6;
+const MIN_SPAN_MS = 20;
+const PADDING_RATIO = 0.02;
+
+/* Graduation "ronde" immediatement superieure a l'ecart brut, pour que
+ * les libelles tombent sur des valeurs lisibles (100ms, 500ms, 1s, 5s...)
+ * plutot que sur des multiples arbitraires. */
+const NICE_STEPS_MS = [
+  10, 20, 50, 100, 200, 500,
+  1_000, 2_000, 5_000, 10_000, 15_000, 30_000,
+  60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000,
+  3_600_000, 7_200_000, 21_600_000, 43_200_000, 86_400_000,
+];
+
+function niceStep(rawMs: number): number {
+  return NICE_STEPS_MS.find(s => s >= rawMs) ?? NICE_STEPS_MS[NICE_STEPS_MS.length - 1];
+}
+
+function formatAxisLabel(ms: number, stepMs: number): string {
+  const d = new Date(ms);
+  const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+  const hms = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  /* Sous la seconde, l'heure seule ne distingue plus deux graduations. */
+  return stepMs < 1000 ? `${hms}.${pad(d.getMilliseconds(), 3)}` : hms;
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}min`;
+  return `${(ms / 3_600_000).toFixed(1)}h`;
+}
+
+export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }: FrameTimelineProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [size, setSize] = useState({ width: 0, height: 0 });
+
+  /* Fenetre temporelle affichee. null = suivi automatique : la vue couvre
+   * toute la capture et s'etend avec les nouvelles trames. Des que
+   * l'utilisateur zoome ou fait un pan, elle devient explicite et on cesse
+   * de la bouger sous ses yeux — meme logique que l'auto-scroll du
+   * tableau. */
+  const [view, setView] = useState<{ start: number; end: number } | null>(null);
+  const dragRef = useRef<{ x: number; start: number; end: number; moved: boolean } | null>(null);
+
+  /* Curseurs de mesure A et B, en instants libres (ms epoch). Toujours
+   * visibles, deplacables a la souris. null tant qu'aucune trame n'a
+   * permis de les positionner. */
+  const [cursors, setCursors] = useState<{ a: number; b: number } | null>(null);
+  const cursorDragRef = useRef<'a' | 'b' | null>(null);
+  const [overCursor, setOverCursor] = useState(false);
+
+  const [height, setHeight] = useState(loadStoredHeight);
+  const resizeRef = useRef<{ y: number; height: number } | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const maxHeightRef = useRef(Number.POSITIVE_INFINITY);
+
+  useEffect(() => {
+    localStorage.setItem(TIMELINE_HEIGHT_KEY, String(height));
+  }, [height]);
+
+
+  /* La hauteur memorisee peut depasser la place disponible (fenetre plus
+   * petite qu'a la session precedente) : on la ramene dans les bornes des
+   * que la colonne est mesurable, et a chaque redimensionnement fenetre. */
+  useEffect(() => {
+    const clamp = () => {
+      const column = rootRef.current?.parentElement;
+      if (!column) return;
+      const max = Math.max(HEIGHT_MIN, column.clientHeight - TABLE_MIN_HEIGHT);
+      setHeight(h => Math.min(h, max));
+    };
+    clamp();
+    window.addEventListener('resize', clamp);
+    return () => window.removeEventListener('resize', clamp);
+  }, []);
+
+  /* Redimensionnement : la poignee est en haut, tirer vers le haut
+   * agrandit la timeline (et reduit la table d'autant). Ecouteurs poses
+   * sur window pour que le geste survive a une sortie du curseur. */
+  const startResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      /* Plafond calcule sur la colonne qui contient table + timeline, et
+       * non sur la fenetre entiere : c'est cette hauteur-la qui est
+       * partagee entre les deux, et elle exclut l'en-tete et les marges. */
+      const column = rootRef.current?.parentElement;
+      const available = column?.clientHeight ?? window.innerHeight;
+      maxHeightRef.current = Math.max(HEIGHT_MIN, available - TABLE_MIN_HEIGHT);
+      resizeRef.current = { y: e.clientY, height };
+    },
+    [height]
+  );
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const r = resizeRef.current;
+      if (!r) return;
+      /* Curseur maintenu et selection de texte neutralisee pendant tout le
+       * geste, y compris quand la souris sort de la poignee. */
+      document.body.style.cursor = 'row-resize';
+      document.body.style.userSelect = 'none';
+      const max = maxHeightRef.current;
+      setHeight(Math.max(HEIGHT_MIN, Math.min(max, r.height - (e.clientY - r.y))));
+    };
+    const onUp = () => {
+      if (!resizeRef.current) return;
+      resizeRef.current = null;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, []);
+
+  /* Points tries par temps, en millisecondes. `frames` arrive deja en
+   * ordre d'arrivee, mais la timeline ne doit pas dependre de cette
+   * garantie pour positionner ses ticks. */
+  const points = useMemo(() => {
+    return frames
+      .map(frame => {
+        const bytes = frame.hex.length / 2;
+        const toaMs = sf && bw ? computeToaMs(bytes, sf, bw) : 0;
+        /* Le firmware horodate a la reception de "+TEST: LEN", emise par le
+         * Wio-E5 en fin de demodulation. `t` est donc proche de la FIN de
+         * l'emission : la barre s'etend vers la gauche (tStart = t - ToA),
+         * pas vers la droite. */
+        const t = frame.timestamp * 1000;
+        return { frame, t, tStart: t - toaMs, bytes, toaMs };
+      })
+      .sort((a, b) => a.t - b.t);
+  }, [frames, sf, bw]);
+
+  const bounds = useMemo(() => {
+    if (points.length === 0) return null;
+    /* La premiere barre commence a son tStart (debut estime), la derniere
+     * finit a son t (fin horodatee). */
+    const first = points[0].tStart;
+    const last = points[points.length - 1].t;
+    /* Capture instantanee (une seule trame, ou rafale tres courte) : on
+     * force une fenetre minimale, sinon l'echelle serait degeneree. */
+    const span = Math.max(last - first, MIN_SPAN_MS);
+    const pad = span * PADDING_RATIO;
+    return { start: first - pad, end: last + pad };
+  }, [points]);
+
+  const activeView = view ?? bounds;
+
+  /* Placement des curseurs aux quarts de la plage. Se declenche quand on
+   * passe de zero a des trames (montage, chargement de capture), pas a
+   * chaque trame live — sinon les curseurs sauteraient en continu, la
+   * borne haute de `bounds` avancant a chaque reception. On garde donc les
+   * curseurs des qu'il y en a, et on ne (re)place que sur une transition
+   * vide -> non vide. */
+  const prevStart = useRef<number | null>(null);
+  useEffect(() => {
+    if (!bounds) {
+      prevStart.current = null;
+      return;
+    }
+    /* Debut de plage inchange = meme capture qui s'etend en live : on ne
+     * touche pas aux curseurs. Debut different = nouvelle capture (ou
+     * premiere) : on les (re)place. La borne basse ne bouge pas en live,
+     * les nouvelles trames n'allongeant que la fin. */
+    if (prevStart.current === null || Math.abs(bounds.start - prevStart.current) > 1) {
+      const span = bounds.end - bounds.start;
+      setCursors({ a: bounds.start + span * 0.25, b: bounds.start + span * 0.75 });
+    }
+    prevStart.current = bounds.start;
+  }, [bounds]);
+
+  /* Mesure A→B : ecart temporel et nombre de trames dont l'instant tombe
+   * dans l'intervalle. */
+  const measure = useMemo(() => {
+    if (!cursors) return null;
+    const from = Math.min(cursors.a, cursors.b);
+    const to = Math.max(cursors.a, cursors.b);
+    return {
+      from,
+      to,
+      deltaMs: to - from,
+      count: points.filter(p => p.t >= from && p.t <= to).length,
+    };
+  }, [cursors, points]);
+
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver(entries => {
+      const r = entries[0].contentRect;
+      setSize({ width: r.width, height: r.height });
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  /* Selection venue d'ailleurs (clic dans le tableau) : on ne recentre que
+   * si la trame est hors de la vue courante. Recentrer systematiquement
+   * ferait sauter la timeline a chaque clic, y compris quand la trame
+   * etait deja visible. */
+  useEffect(() => {
+    if (!view || !selectedFrameId) return;
+    const target = points.find(p => p.frame.id === selectedFrameId);
+    if (!target) return;
+    if (target.t >= view.start && target.t <= view.end) return;
+    const span = view.end - view.start;
+    setView({ start: target.t - span / 2, end: target.t + span / 2 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFrameId]);
+
+  const toX = useCallback(
+    (t: number) => {
+      if (!activeView || size.width === 0) return 0;
+      return ((t - activeView.start) / (activeView.end - activeView.start)) * size.width;
+    },
+    [activeView, size.width]
+  );
+
+  /* ---------- Rendu ---------- */
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !activeView || size.width === 0) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = size.width * dpr;
+    canvas.height = size.height * dpr;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    /* setTransform et non scale : scale se cumule d'un rendu au suivant,
+     * le contenu finissait dessine hors cadre. */
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, size.width, size.height);
+
+    const plotH = size.height - AXIS_HEIGHT;
+    const spanMs = activeView.end - activeView.start;
+
+    /* --- Graduations --- */
+    const targetTicks = Math.max(2, Math.floor(size.width / 130));
+    const step = niceStep(spanMs / targetTicks);
+    const firstTick = Math.ceil(activeView.start / step) * step;
+
+    ctx.font = `${AXIS_FONT_PX}px monospace`;
+    ctx.textBaseline = 'top';
+    for (let t = firstTick; t <= activeView.end; t += step) {
+      const x = toX(t);
+      ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(Math.round(x) + 0.5, 0);
+      ctx.lineTo(Math.round(x) + 0.5, plotH);
+      ctx.stroke();
+
+      ctx.fillStyle = 'rgba(148,163,184,0.75)';
+      ctx.textAlign = 'center';
+      ctx.fillText(formatAxisLabel(t, step), x, plotH + 4);
+    }
+
+    /* Ligne de base */
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.beginPath();
+    ctx.moveTo(0, Math.round(plotH) + 0.5);
+    ctx.lineTo(size.width, Math.round(plotH) + 0.5);
+    ctx.stroke();
+
+    /* --- Trames ---
+     * Largeur = Time on Air (occupation reelle du canal), hauteur =
+     * taille du payload. Deux trames qui se chevauchent a l'ecran se
+     * chevauchent donc reellement sur l'air. */
+    const baseline = plotH - 4;
+    const usableH = baseline - 6;
+    for (const p of points) {
+      /* La barre va de tStart (debut estime) a t (fin horodatee). */
+      const x = toX(p.tStart);
+      const w = Math.max(MIN_FRAME_PX, toX(p.t) - x);
+      if (x + w < -2 || x > size.width + 2) continue;
+
+      const ratio = Math.min(1, p.bytes / BAR_FULL_SCALE_BYTES);
+      const h = usableH * (BAR_MIN_RATIO + ratio * (BAR_MAX_RATIO - BAR_MIN_RATIO));
+      const isSelected = p.frame.id === selectedFrameId;
+
+      ctx.fillStyle = isSelected ? '#47ABFF' : rssiColor(p.frame.rssi);
+      ctx.globalAlpha = isSelected ? 1 : 0.75;
+      ctx.fillRect(x, baseline - h, w, h);
+      ctx.globalAlpha = 1;
+
+      if (isSelected) {
+        ctx.strokeStyle = '#47ABFF';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(Math.round(x) - 0.5, baseline - h - 1.5, Math.round(w) + 1, h + 2);
+      }
+    }
+
+    /* --- Curseurs de mesure --- */
+    if (measure) {
+      const xa = toX(measure.from);
+      const xb = toX(measure.to);
+      ctx.fillStyle = 'rgba(71,171,255,0.10)';
+      ctx.fillRect(xa, 0, xb - xa, plotH);
+    }
+
+    const drawCursor = (t: number, label: string) => {
+      const x = Math.round(toX(t)) + 0.5;
+
+      ctx.strokeStyle = '#47ABFF';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, plotH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = '#47ABFF';
+      ctx.fillRect(x - 8, 0, 16, 14);
+      ctx.fillStyle = '#0B1220';
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(label, x, 2);
+    };
+
+    if (cursors) {
+      drawCursor(cursors.a, 'A');
+      drawCursor(cursors.b, 'B');
+    }
+  }, [points, activeView, size, selectedFrameId, toX, cursors, measure]);
+
+  /* ---------- Interactions ---------- */
+
+  const frameAt = useCallback(
+    (clientX: number): DecodedFrame | null => {
+      const canvas = canvasRef.current;
+      if (!canvas || !activeView) return null;
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      let best: DecodedFrame | null = null;
+      let bestDist = TICK_HIT_RADIUS;
+      for (const p of points) {
+        const x0 = toX(p.tStart);
+        const x1 = Math.max(x0 + MIN_FRAME_PX, toX(p.t));
+        /* Distance au rectangle : nulle si le curseur est dedans. */
+        const d = x < x0 ? x0 - x : x > x1 ? x - x1 : 0;
+        if (d <= bestDist) {
+          bestDist = d;
+          best = p.frame;
+        }
+      }
+      return best;
+    },
+    [points, activeView, toX]
+  );
+
+  /* Attache native : React enregistre onWheel en passif, ou preventDefault
+   * est ignore — la page defilerait en meme temps qu'on zoome. */
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const onWheel = (e: WheelEvent) => {
+      if (!activeView || size.width === 0) return;
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const ratio = (e.clientX - rect.left) / size.width;
+      const span = activeView.end - activeView.start;
+      /* Zoom centre sur le curseur : le point sous la souris reste fixe. */
+      const factor = e.deltaY > 0 ? 1.25 : 0.8;
+      const newSpan = Math.max(MIN_SPAN_MS, span * factor);
+      const anchor = activeView.start + span * ratio;
+      setView({
+        start: anchor - newSpan * ratio,
+        end: anchor + newSpan * (1 - ratio),
+      });
+    };
+
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', onWheel);
+  }, [activeView, size.width]);
+
+  /* Curseur sous la souris, s'il y en a un dans la zone de saisie. */
+  const cursorAt = useCallback(
+    (clientX: number): 'a' | 'b' | null => {
+      const canvas = canvasRef.current;
+      if (!canvas || !cursors) return null;
+      const x = clientX - canvas.getBoundingClientRect().left;
+      const da = Math.abs(toX(cursors.a) - x);
+      const db = Math.abs(toX(cursors.b) - x);
+      if (Math.min(da, db) > CURSOR_GRAB_PX) return null;
+      return da <= db ? 'a' : 'b';
+    },
+    [cursors, toX]
+  );
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      if (!activeView) return;
+      /* Attraper un curseur prime sur le pan de la vue. */
+      const grabbed = cursorAt(e.clientX);
+      if (grabbed) {
+        cursorDragRef.current = grabbed;
+        return;
+      }
+      dragRef.current = {
+        x: e.clientX,
+        start: activeView.start,
+        end: activeView.end,
+        moved: false,
+      };
+    },
+    [activeView, cursorAt]
+  );
+
+  /* Aimantation : convertit une position pixel en temps, puis colle au
+   * bord de trame (debut ou fin = debut + ToA) le plus proche s'il est a
+   * moins de SNAP_PX. Sinon renvoie le temps libre. Le seuil est en pixels
+   * pour rester constant quel que soit le zoom. */
+  const snapTime = useCallback(
+    (x: number): number => {
+      if (!activeView || size.width === 0) return 0;
+      const span = activeView.end - activeView.start;
+      const t = activeView.start + (x / size.width) * span;
+      let best = t;
+      let bestPx = SNAP_PX;
+      for (const p of points) {
+        for (const edge of [p.tStart, p.t]) {
+          const dpx = Math.abs(toX(edge) - x);
+          if (dpx < bestPx) {
+            bestPx = dpx;
+            best = edge;
+          }
+        }
+      }
+      return best;
+    },
+    [activeView, size.width, points, toX]
+  );
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      const grabbed = cursorDragRef.current;
+      if (grabbed && activeView && size.width > 0) {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const x = e.clientX - canvas.getBoundingClientRect().left;
+        setCursors(prev => (prev ? { ...prev, [grabbed]: snapTime(x) } : prev));
+        return;
+      }
+
+      const drag = dragRef.current;
+      if (drag && size.width > 0) {
+        const dx = e.clientX - drag.x;
+        if (Math.abs(dx) > 2) drag.moved = true;
+        const span = drag.end - drag.start;
+        const shift = (dx / size.width) * span;
+        setView({ start: drag.start - shift, end: drag.end - shift });
+        return;
+      }
+      setOverCursor(cursorAt(e.clientX) != null);
+    },
+    [cursorAt, snapTime, activeView, size.width]
+  );
+
+  const endDrag = useCallback(() => {
+    dragRef.current = null;
+    cursorDragRef.current = null;
+  }, []);
+
+  const handleClick = useCallback(
+    (e: React.MouseEvent) => {
+      /* Ni un pan ni un deplacement de curseur ne valent selection. */
+      if (dragRef.current?.moved || cursorDragRef.current) return;
+      const frame = frameAt(e.clientX);
+      if (frame) onSelectFrame(frame);
+    },
+    [frameAt, onSelectFrame]
+  );
+
+  const resetView = useCallback(() => setView(null), []);
+
+  /* Recadre les curseurs sur la vue courante : pratique apres un zoom qui
+   * les a laisses hors champ. */
+  const centerCursors = useCallback(() => {
+    if (!activeView) return;
+    const span = activeView.end - activeView.start;
+    setCursors({
+      a: activeView.start + span * 0.25,
+      b: activeView.start + span * 0.75,
+    });
+  }, [activeView]);
+
+  const spanLabel = activeView ? formatDuration(activeView.end - activeView.start) : '';
+
+  return (
+    <div
+      ref={rootRef}
+      style={{ height }}
+      className="flex-shrink-0 flex flex-col rounded-card bg-surface border border-[rgba(255,255,255,0.04)] shadow-subtle"
+    >
+      {/* Poignee de redimensionnement : bande fine en haut du panneau. */}
+      <div
+        onMouseDown={startResize}
+        className="group h-2 flex-shrink-0 cursor-row-resize flex items-center justify-center"
+        title="Glisser pour redimensionner"
+      >
+        <div className="w-10 h-[3px] rounded-full bg-border group-hover:bg-brand/50 transition-colors duration-200" />
+      </div>
+
+      {/* En-tete a structure fixe : chaque zone garde sa place, les
+        * elements se contentent d'etre actifs ou non. Aucune apparition/
+        * disparition qui ferait osciller la ligne. Les infos de survol ont
+        * ete retirees : elles font double emploi avec le panneau de detail. */}
+      <div className="flex flex-shrink-0 items-center justify-between px-4 gap-4">
+        <div className="flex items-baseline gap-3 min-w-0">
+          <span className="text-[11px] font-medium text-text-secondary uppercase tracking-wider">
+            Timeline
+          </span>
+          <span className="font-mono text-[11px] text-text-muted">{spanLabel || '—'}</span>
+          <span className="font-mono text-[12px] text-brand whitespace-nowrap">
+            {measure
+              ? `Δ A→B ${formatDuration(measure.deltaMs)} · ${measure.count} trame${measure.count > 1 ? 's' : ''}`
+              : ''}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <button
+            onClick={centerCursors}
+            disabled={!cursors}
+            className="px-2 py-0.5 bg-overlay text-text-secondary rounded-element text-[11px] font-medium whitespace-nowrap hover:bg-brand/10 hover:text-brand disabled:opacity-30 disabled:hover:bg-overlay disabled:hover:text-text-secondary transition-colors duration-200"
+          >
+            Recadrer curseurs
+          </button>
+          <button
+            onClick={resetView}
+            disabled={!view}
+            className="px-2 py-0.5 bg-overlay text-text-secondary rounded-element text-[11px] font-medium whitespace-nowrap hover:bg-brand/10 hover:text-brand disabled:opacity-30 disabled:hover:bg-overlay disabled:hover:text-text-secondary transition-colors duration-200"
+          >
+            Vue complete
+          </button>
+        </div>
+      </div>
+
+      <div ref={wrapRef} className="relative flex-1 min-h-0 mx-2 mb-2">
+        {frames.length === 0 ? (
+          <div className="absolute inset-0 flex items-center justify-center">
+            <span className="text-[12px] text-text-muted">Aucune trame</span>
+          </div>
+        ) : (
+          <canvas
+            ref={canvasRef}
+            className={`absolute inset-0 w-full h-full ${
+              cursorDragRef.current || overCursor
+                ? 'cursor-ew-resize'
+                : dragRef.current
+                  ? 'cursor-grabbing'
+                  : 'cursor-crosshair'
+            }`}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={endDrag}
+            onMouseLeave={() => {
+              endDrag();
+              setOverCursor(false);
+            }}
+            onClick={handleClick}
+          />
+        )}
+      </div>
+    </div>
+  );
+}

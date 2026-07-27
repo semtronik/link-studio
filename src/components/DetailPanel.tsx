@@ -1,5 +1,6 @@
 import { useState, Fragment } from 'react';
 import { HexColorized } from './HexColorized';
+import { computeToaMs } from '../utils/loraToa';
 import type { DecodedFrame, Field, Annotation } from '../types/parser';
 
 interface DetailPanelProps {
@@ -8,6 +9,15 @@ interface DetailPanelProps {
    * tableau ne soit pas redimensionne a chaque selection. */
   frame: DecodedFrame | null;
   annotation?: Annotation;
+  /* Config radio courante, pour le Time on Air theorique. */
+  sf?: number;
+  bw?: number;
+}
+
+function formatToa(ms: number): string {
+  if (ms < 10) return `${ms.toFixed(2)} ms`;
+  if (ms < 1000) return `${ms.toFixed(1)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
 }
 
 const ANNOTATION_BADGE: Record<Annotation['status'], string> = {
@@ -66,7 +76,7 @@ function ParsedFieldsGrid({ fields, highlightedField, onHighlightField }: {
 const PANEL_CLASSES =
   'h-[260px] @[1140px]:h-auto @[1140px]:w-[40%] @[1140px]:min-w-[420px] @[1140px]:max-w-[640px] flex-shrink-0 overflow-y-auto bg-surface rounded-card border border-[rgba(255,255,255,0.04)] shadow-subtle p-4';
 
-export function DetailPanel({ frame, annotation }: DetailPanelProps) {
+export function DetailPanel({ frame, annotation, sf, bw }: DetailPanelProps) {
   const [highlightedField, setHighlightedField] = useState<string | null>(null);
 
   if (!frame) {
@@ -99,13 +109,24 @@ export function DetailPanel({ frame, annotation }: DetailPanelProps) {
       key={frame.id}
       className={`${PANEL_CLASSES} animate-[detail-slide-in_200ms_ease-out]`}
     >
-      <div className="flex items-center gap-3 mb-3">
+      <div className="flex items-center gap-3 mb-2">
         <h3 className="text-[13px] font-medium text-text-secondary uppercase tracking-wider">
           Detail trame — {formatTimestamp(frame.timestamp)}
         </h3>
         {annotation && (
           <span className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-medium border ${ANNOTATION_BADGE[annotation.status]}`}>
             {annotation.label}
+          </span>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-x-4 gap-y-1 mb-3 font-mono text-[12px] text-text-muted">
+        <span>{byteCount} o</span>
+        {frame.rssi != null && <span>{frame.rssi} dBm</span>}
+        {frame.snr != null && <span>{frame.snr} dB</span>}
+        {sf && bw && (
+          <span title="Time on Air theorique (config LFT : CR 4/8, preambule 15)">
+            ToA {formatToa(computeToaMs(byteCount, sf, bw))}
           </span>
         )}
       </div>

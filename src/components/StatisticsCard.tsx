@@ -1,5 +1,4 @@
-import { useEffect, useState } from 'react';
-import { useSerialContext } from '../contexts/SerialContext';
+import { useEffect, useMemo, useState } from 'react';
 import { useFrameContext } from '../contexts/FrameContext';
 import { ProgressiveValue } from './ProgressiveValue';
 
@@ -31,8 +30,20 @@ function formatLastFrameAge(ageSeconds: number): { text: string; level: 'normal'
 }
 
 export function StatisticsCard() {
-  const { connected, stats } = useSerialContext();
   const { frames } = useFrameContext();
+
+  /* Moyennes calculees a partir des trames et non du backend : la carte
+   * fonctionne ainsi identiquement en live et en replay (le backend ne
+   * rafraichit pas ses stats apres un chargement de capture). */
+  const avgRssi = useMemo(() => {
+    const vals = frames.map(f => f.rssi).filter((v): v is number => v != null);
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  }, [frames]);
+
+  const avgSnr = useMemo(() => {
+    const vals = frames.map(f => f.snr).filter((v): v is number => v != null);
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  }, [frames]);
 
   /* Tick d'horloge pour forcer un re-render périodique du compteur
    * "dernière trame il y a X". Toutes les 10 s suffit pour la précision
@@ -43,10 +54,10 @@ export function StatisticsCard() {
     return () => clearInterval(id);
   }, []);
 
-  if (!connected) {
+  if (frames.length === 0) {
     return (
       <div className="bg-surface rounded-card p-4 text-center text-text-muted border border-border text-[13px]">
-        Connectez un appareil pour voir les statistiques
+        Connectez un appareil ou chargez une capture pour voir les statistiques
       </div>
     );
   }
@@ -70,8 +81,8 @@ export function StatisticsCard() {
       <div className="divide-y divide-border/50">
         <div className="flex justify-between items-center py-2">
           <span className="text-[13px] text-text-secondary">RSSI moyen</span>
-          {stats.avgRssi != null ? (
-            <ProgressiveValue value={stats.avgRssi} type="rssi" decimals={0} unit="dBm" />
+          {avgRssi != null ? (
+            <ProgressiveValue value={avgRssi} type="rssi" decimals={0} unit="dBm" />
           ) : (
             <span className="font-mono text-[13px] text-text-muted">--</span>
           )}
@@ -79,8 +90,8 @@ export function StatisticsCard() {
 
         <div className="flex justify-between items-center py-2">
           <span className="text-[13px] text-text-secondary">SNR moyen</span>
-          {stats.avgSnr != null ? (
-            <ProgressiveValue value={stats.avgSnr} type="snr" decimals={1} unit="dB" />
+          {avgSnr != null ? (
+            <ProgressiveValue value={avgSnr} type="snr" decimals={1} unit="dB" />
           ) : (
             <span className="font-mono text-[13px] text-text-muted">--</span>
           )}

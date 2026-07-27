@@ -90,6 +90,7 @@ export function FrameTable({ frames, annotations, selectedFrameId, onSelectFrame
   const scrollRef = useRef<HTMLDivElement>(null);
   const isUserScrolledDown = useRef(false);
   const payloadColRef = useRef<HTMLDivElement>(null);
+  const selectedRowRef = useRef<HTMLDivElement>(null);
   const prevFrameCount = useRef(frames.length);
 
   /* Plus recent en haut. `frames` arrive en ordre d'arrivee croissant :
@@ -148,11 +149,28 @@ export function FrameTable({ frames, annotations, selectedFrameId, onSelectFrame
     prevFrameCount.current = frames.length;
   }, [frames.length]);
 
+  /* Selection venue d'ailleurs (clic dans la timeline) : si la ligne est
+   * hors de la vue, on la recentre ; si elle est deja visible, on ne touche
+   * pas au scroll — recentrer a chaque clic ferait sauter la vue. */
+  useEffect(() => {
+    if (!selectedFrameId) return;
+    const row = selectedRowRef.current;
+    const container = scrollRef.current;
+    if (!row || !container) return;
+
+    const rowRect = row.getBoundingClientRect();
+    const boxRect = container.getBoundingClientRect();
+    const visible = rowRect.top >= boxRect.top && rowRect.bottom <= boxRect.bottom;
+    if (!visible) {
+      row.scrollIntoView({ block: 'center' });
+    }
+  }, [selectedFrameId]);
+
   return (
     <div
       ref={scrollRef}
       onScroll={handleScroll}
-      className="flex-1 overflow-auto rounded-card bg-surface border border-[rgba(255,255,255,0.04)] shadow-subtle"
+      className="flex-1 min-h-[120px] overflow-auto rounded-card bg-surface border border-[rgba(255,255,255,0.04)] shadow-subtle"
     >
       {/* Pas de <table> : aucune colonne de tableau ne porte plus la mise en
         * page (les lignes ont deux niveaux, dont un pleine largeur). Garder
@@ -179,8 +197,11 @@ export function FrameTable({ frames, annotations, selectedFrameId, onSelectFrame
         </div>
 
         {displayedFrames.length === 0 ? (
-          <div className="px-4 py-8 text-center text-text-muted italic">
-            En attente de trames...
+          <div className="px-4 py-10 text-center">
+            <p className="text-sm text-text-muted">Aucune trame</p>
+            <p className="text-[12px] text-text-muted mt-1">
+              Connectez un appareil ou chargez une capture
+            </p>
           </div>
         ) : (
           displayedFrames.map(({ frame, deltaMs }) => {
@@ -189,13 +210,15 @@ export function FrameTable({ frames, annotations, selectedFrameId, onSelectFrame
 
             /* Un seul bloc par trame : le survol et la selection eclairent
              * les deux lignes visuelles (mesures puis payload) d'un coup. */
+            const isSelected = selectedFrameId === frame.id;
             return (
               <div
                 key={frame.id}
+                ref={isSelected ? selectedRowRef : undefined}
                 className={`px-4 py-2.5 border-b border-[rgba(255,255,255,0.04)] cursor-pointer hover:bg-brand-50 transition-colors duration-200 ${
-                  selectedFrameId === frame.id ? 'bg-brand-100' : ''
+                  isSelected ? 'bg-brand-100' : ''
                 }`}
-                onClick={() => onSelectFrame(selectedFrameId === frame.id ? null : frame)}
+                onClick={() => onSelectFrame(isSelected ? null : frame)}
               >
                 <div className={GRID_CLASSES}>
                   <span className="font-mono text-xs text-text-muted whitespace-nowrap">
