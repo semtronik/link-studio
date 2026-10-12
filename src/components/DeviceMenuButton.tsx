@@ -7,7 +7,7 @@ export function DeviceMenuButton({ onClick, active }: DeviceMenuButtonProps) {
   return (
     <button
       onClick={onClick}
-      title="LFT"
+      title="Device"
       className={`w-9 h-9 flex items-center justify-center rounded-element transition-colors ${
         active
           ? 'bg-brand/20 text-brand'

@@ -11,7 +11,7 @@ import { ConfigModal } from './components/ConfigModal';
 import { FrameViewer } from './components/FrameViewer';
 import { StatisticsCard } from './components/StatisticsCard';
 import { DeviceMenuButton } from './components/DeviceMenuButton';
-import { LFTView } from './components/LFTView';
+import { DeviceView } from './components/DeviceView';
 import { useTheme } from './hooks/useTheme';
 import type { PortInfo } from './hooks/useBackend';
 import type { CaptureFile } from './types/capture';
@@ -27,45 +27,39 @@ function AppContent() {
   const [configModalOpen, setConfigModalOpen] = useState(false);
   const closeConfigModal = useCallback(() => setConfigModalOpen(false), []);
   const [connecting, setConnecting] = useState(false);
-  // Plateforme hôte récupérée une fois au mount, utilisée pour adapter
-  // les messages d'erreur localisés (notamment permission_denied qui
-  // diffère entre Linux/Mac/Windows).
+  // permission_denied advice differs per OS.
   const [platform, setPlatform] = useState<Platform>('other');
   useEffect(() => {
     invoke<string>('get_platform')
       .then((p) => setPlatform(p as Platform))
-      .catch(() => { /* ignore — restera "other" */ });
+      .catch(() => { /* stays 'other' */ });
   }, []);
   const [appVersion, setAppVersion] = useState<string>('');
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => { /* ignore */ });
   }, []);
-  // Navigation mono-toggle : 'monitor' (sidebar + FrameViewer) vs 'lft' (firmware + diagnostic).
-  const [currentView, setCurrentView] = useState<'monitor' | 'lft'>('monitor');
+  // 'monitor': sidebar + frames; 'device': firmware update + diagnostics.
+  const [currentView, setCurrentView] = useState<'monitor' | 'device'>('monitor');
   useEffect(() => {
-    if (!connected && currentView === 'lft') setCurrentView('monitor');
+    if (!connected && currentView === 'device') setCurrentView('monitor');
   }, [connected, currentView]);
   const [replayFilename, setReplayFilename] = useState<string | null>(null);
   const [currentPortInfo, setCurrentPortInfo] = useState<PortInfo | null>(null);
   const connectingPortRef = useRef<string | null>(null);
 
-  // Enregistrer le callback de déconnexion accidentelle
   useEffect(() => {
     setOnDisconnected(() => {
       setCurrentPortInfo(null);
       setCurrentView('monitor');
-      addToast('warning', 'Device déconnecté', 'Trames conservées');
+      addToast('warning', 'Device disconnected', 'Frames kept');
     });
     return () => setOnDisconnected(null);
   }, [setOnDisconnected, addToast]);
 
-  // Handler connexion série — avec déconnexion automatique si déjà connecté
   const handleConnect = useCallback(async (port: string) => {
-    // Déconnexion silencieuse si déjà connecté (changement de source à chaud)
     if (connected) {
       try { await disconnect(); } catch { /* ignore */ }
     }
-    // Si en mode replay, fermer silencieusement
     if (dataSource === 'replay') {
       clearFrames();
       resetSource();
@@ -77,11 +71,8 @@ function AppContent() {
     try {
       await connect(port);
       setCurrentPortInfo(null); // Will be populated by port detection if available
-      addToast('success', 'Connecté', `LFT sur ${port}`);
+      addToast('success', 'Connected', `Link-LR on ${port}`);
     } catch (err) {
-      // Le backend Rust renvoie une erreur structurée (ConnectError) :
-      // { code: "port_busy" | "port_not_found" | ..., port, raw }.
-      // On délègue au mapping localisé qui produit titre + détail.
       const { title, detail } = describeConnectError(err, port, platform);
       addToast('error', title, detail);
     } finally {
@@ -90,9 +81,7 @@ function AppContent() {
     }
   }, [connected, dataSource, connect, disconnect, clearFrames, resetSource, addToast, platform]);
 
-  // Handler chargement capture
   const handleLoadCapture = useCallback(async (file: File) => {
-    // Déconnexion silencieuse si connecté
     if (connected) {
       try { await disconnect(); } catch { /* ignore */ }
     }
@@ -102,14 +91,12 @@ function AppContent() {
       const data = JSON.parse(text) as CaptureFile;
 
       if (!data.frames || !Array.isArray(data.frames)) {
-        addToast('error', 'Fichier invalide', 'Le fichier ne contient pas de champ "frames"');
+        addToast('error', 'Invalid file', 'Missing "frames" field');
         return;
       }
 
-      // Envoyer les frames brutes à Rust pour normalisation
       const frameData = await loadCapture(data.config ?? null, data.frames);
 
-      // Convertir en DecodedFrame pour le FrameContext
       const decoded = frameData.map(f => ({
         id: f.id,
         type: f.type as 'frame',
@@ -122,33 +109,31 @@ function AppContent() {
       replaceFrames(decoded);
       setReplayFilename(file.name);
       setCurrentPortInfo(null);
-      addToast('success', 'Capture chargée', `${frameData.length} trame${frameData.length > 1 ? 's' : ''} — ${file.name}`);
+      addToast('success', 'Capture loaded', `${frameData.length} frame${frameData.length !== 1 ? 's' : ''} — ${file.name}`);
     } catch {
-      addToast('error', 'Fichier invalide', 'Le fichier n\'est pas un JSON valide');
+      addToast('error', 'Invalid file', 'Not valid JSON');
     }
   }, [connected, disconnect, loadCapture, replaceFrames, addToast]);
 
-  // Handler déconnexion volontaire — conserve les trames
+  // Keeps frames; closing a replay clears them.
   const handleDisconnect = useCallback(async () => {
     await disconnect();
     setCurrentPortInfo(null);
     setCurrentView('monitor');
-    addToast('info', 'Déconnecté', 'Appareil déconnecté');
+    addToast('info', 'Disconnected', 'Device disconnected');
   }, [disconnect, addToast]);
 
-  // Handler fermeture replay — efface les trames
   const handleCloseReplay = useCallback(() => {
     clearFrames();
     resetSource();
     setReplayFilename(null);
   }, [clearFrames, resetSource]);
 
-  // Bouton toggle thème
   const themeToggle = (
     <button
       onClick={toggleTheme}
       className="w-8 h-8 flex items-center justify-center rounded-element text-brand/70 hover:text-brand hover:bg-brand/10 transition-colors duration-200"
-      title={theme === 'dark' ? 'Mode clair' : 'Mode sombre'}
+      title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
     >
       {theme === 'dark' ? (
         <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
@@ -181,17 +166,17 @@ function AppContent() {
 
         {connected && (
           <DeviceMenuButton
-            onClick={() => setCurrentView(currentView === 'lft' ? 'monitor' : 'lft')}
-            active={currentView === 'lft'}
+            onClick={() => setCurrentView(currentView === 'device' ? 'monitor' : 'device')}
+            active={currentView === 'device'}
           />
         )}
 
-        {/* Titre centré en absolu — indépendant du contenu gauche/droite */}
+        {/* Absolutely centered, independent of left/right content */}
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5 text-brand mr-2">
             <path d="M2 12 L6 8 L10 16 L14 4 L18 14 L22 10" />
           </svg>
-          <span className="text-brand font-semibold text-sm">LoRa Field Toolkit</span>
+          <span className="text-brand font-semibold text-sm">Link Studio</span>
           {appVersion && (
             <span className="ml-2 text-[11px] text-brand/40 font-mono">v{appVersion}</span>
           )}
@@ -222,7 +207,7 @@ function AppContent() {
             </div>
           </>
         ) : (
-          <LFTView onClose={() => setCurrentView('monitor')} />
+          <DeviceView onClose={() => setCurrentView('monitor')} />
         )}
       </div>
 

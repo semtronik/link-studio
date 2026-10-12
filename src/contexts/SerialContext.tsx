@@ -17,7 +17,7 @@ export function SerialProvider({ children }: { children: ReactNode }) {
 export function useSerialContext(): SerialContextType {
   const ctx = useContext(SerialContext);
   if (!ctx) {
-    throw new Error('useSerialContext doit être utilisé dans un SerialProvider');
+    throw new Error('useSerialContext must be used within a SerialProvider');
   }
   return ctx;
 }

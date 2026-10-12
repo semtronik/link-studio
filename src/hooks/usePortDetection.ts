@@ -10,16 +10,7 @@ interface PortsChangedPayload {
   scanning: boolean;
 }
 
-/**
- * S'abonne au scanner de ports côté Rust.
- *
- * Le scanner tourne en continu côté backend (boucle de fond). Ce hook :
- *   1. Récupère l'état courant au mount via `get_current_ports`.
- *   2. Écoute l'event Tauri `ports_changed` pour toute mise à jour.
- *
- * Aucun polling React. Le rythme de scan (2 s actif / 5 s veille) est
- * piloté séparément par `SourceSelector` via `set_scan_pace`.
- */
+// Subscribes to the Rust port scanner; scan pace is driven by SourceSelector via set_scan_pace.
 export function usePortDetection(): { ports: PortInfo[]; scanning: boolean } {
   const [ports, setPorts] = useState<PortInfo[]>([]);
   const [scanning, setScanning] = useState(true);

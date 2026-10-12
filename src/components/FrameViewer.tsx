@@ -46,9 +46,6 @@ export function FrameViewer() {
   }, [frames, parserInfo?.hasAnalyze, analyzeFrames]);
 
   const decodeAndAdd = useCallback(async (frame: FrameData) => {
-    // Horodatage du boitier (secondes Unix). Le backend Rust a deja arbitre :
-    // timestamp device sur firmware LFT V1 (RTC hardware + settimeofday au
-    // boot), horodatage PC a la reception sur firmware legacy.
     const timestamp = frame.timestamp;
 
     const decodedFrame: DecodedFrame = {
@@ -90,7 +87,6 @@ export function FrameViewer() {
   useEffect(() => {
     if (!parserInfo) return;
 
-    // Reset analyze data si le nouveau parseur ne supporte pas analyze
     if (!parserInfo.hasAnalyze) {
       setAnnotations({});
       setMetrics([]);
@@ -139,8 +135,7 @@ export function FrameViewer() {
     if (!filePath) return;
 
     const capture: CaptureFile = {
-      // Sans config, une capture rechargee ne peut pas recalculer le Time
-      // on Air : la timeline retomberait a des barres de largeur minimale.
+      // Without config, a reloaded capture cannot recompute time on air.
       config: config ?? undefined,
       frames: frames.map(f => ({
         timestamp: f.timestamp,
@@ -154,13 +149,10 @@ export function FrameViewer() {
 
   return (
     <div className="flex flex-col h-full gap-4">
-      {/* Header — `flex-wrap` : en fenetre etroite la barre passe a la ligne
-        * au lieu de comprimer ses elements jusqu'a couper les libelles.
-        * Chaque bloc porte `whitespace-nowrap` pour ne jamais se casser en
-        * son milieu ("Importer .js" sur deux lignes, etc.). */}
+      {/* `flex-wrap` + `whitespace-nowrap`: wrap whole blocks rather than squeeze labels. */}
       <div className="flex flex-wrap justify-between items-center gap-y-2 gap-x-4 flex-shrink-0">
         <h2 className="text-[13px] font-medium text-text-secondary uppercase tracking-wider whitespace-nowrap">
-          Trames capturees <span className="text-brand font-mono">({frames.length})</span>
+          Captured frames <span className="text-brand font-mono">({frames.length})</span>
         </h2>
 
         <div className="flex flex-wrap items-center gap-3">
@@ -176,7 +168,7 @@ export function FrameViewer() {
             disabled={frames.length === 0}
             className="px-3 py-1 rounded-element text-sm font-medium whitespace-nowrap transition-all duration-200 bg-overlay text-text-secondary hover:bg-brand/10 hover:text-brand disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            Exporter
+            Export
           </button>
 
           <button
@@ -185,23 +177,21 @@ export function FrameViewer() {
               paused ? 'bg-rssi-good/20 text-rssi-good' : 'bg-overlay text-text-secondary'
             }`}
           >
-            {paused ? 'Reprendre' : 'Pause'}
+            {paused ? 'Resume' : 'Pause'}
           </button>
 
           <button
             onClick={handleClear}
             className="px-3 py-1 bg-rssi-bad/10 text-rssi-bad rounded-element text-sm font-medium whitespace-nowrap hover:bg-rssi-bad/20 transition-all duration-200"
           >
-            Effacer
+            Clear
           </button>
         </div>
       </div>
 
-      {/* Metrics banner */}
       {metrics.length > 0 && <MetricsBanner metrics={metrics} />}
 
-      {/* Cote a cote si la place le permet, empile sinon. Le seuil porte sur
-        * le conteneur, qui ne peut pas se cibler lui-meme : d'ou l'enfant. */}
+      {/* A container query cannot target the container itself, hence the inner div. */}
       <div className="@container flex-1 min-h-0">
         <div className="h-full flex flex-col @[1140px]:flex-row gap-4 min-h-0">
           <div className="flex-1 flex flex-col gap-4 h-full min-h-0 min-w-0 overflow-hidden">

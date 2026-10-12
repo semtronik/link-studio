@@ -1,22 +1,8 @@
-//! Boucle de scan des ports série côté Rust — source unique de vérité.
-//!
-//! Principe :
-//!   1. Tâche de fond (thread) qui tourne tant que l'app vit.
-//!   2. À chaque tick, énumère les ports, filtre par VID connu, probe les
-//!      nouveaux (VID Espressif) via `get_version`, émet `ports_changed`
-//!      si la liste enrichie change.
-//!   3. Le rythme (pace) est piloté par le frontend via `set_scan_pace` :
-//!      `Active` (dropdown ouvert) = 2 s, `Idle` (dropdown fermé) = 5 s.
-//!   4. Coordination avec `serial_connect` : on skip le probe du port que
-//!      le SerialManager déclare `busy_path` (connecté OU en cours de
-//!      connexion), pour ne pas tenter deux ouvertures concurrentes du
-//!      même COM (Windows → os error 121).
-//!
-//! Aucune commande Tauri n'a besoin d'ouvrir le port pour lister : le
-//! scanner en continu émet l'état enrichi, React s'abonne via `listen`.
+//! Background serial port scanner, the single source of truth for the port list.
+//! Probes Espressif ports with `get_version` and emits `ports_changed` on change.
 
 use crate::lora_protocol::{
-    DeviceMessage, FirmwareProfile, PortFirmwareInfo, PortInfo,
+    DeviceMessage, DeviceKind, PortFirmwareInfo, PortInfo,
 };
 use crate::serial_manager::SerialManager;
 use serde::Serialize;
@@ -28,8 +14,6 @@ use tauri::{AppHandle, Emitter};
 
 pub const EVENT_PORTS_CHANGED: &str = "ports_changed";
 
-/// Rythme du scan. Passé à `Active` quand l'UI a besoin de réactivité
-/// (dropdown ouvert), `Idle` sinon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanPace {
     Active,
@@ -45,9 +29,6 @@ impl ScanPace {
     }
 }
 
-/// Payload émis au frontend quand la liste change. `scanning` passe à true
-/// pendant qu'un probe est en cours (les ports connus restent visibles,
-/// l'UI peut afficher un spinner).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortsChangedEvent {
@@ -55,21 +36,12 @@ pub struct PortsChangedEvent {
     pub scanning: bool,
 }
 
-/// État partagé entre la boucle et les commandes Tauri. Le Condvar permet
-/// à `set_scan_pace` et `refresh_now` de réveiller la boucle immédiatement
-/// plutôt que d'attendre la fin de l'intervalle courant.
 pub struct ScannerState {
     pace: ScanPace,
-    /// Ports actuellement connus (enrichis). Expose `get_current_ports`
-    /// sans avoir à refaire un scan.
     last_ports: Vec<PortInfo>,
-    /// Timestamp du dernier scan complet. Permet `refresh_now` à la demande.
     force_refresh: bool,
-    /// Path du port que le scanner est en train de probe physiquement
-    /// (port ouvert, `get_version` envoyé, en attente de réponse). Utilisé
-    /// par `ConnectingGuard` pour attendre la fin du probe avant d'ouvrir
-    /// le même port côté `serial_connect` — sans ça, les deux ouvertures
-    /// concurrentes se marchent dessus sous Windows (os error 121).
+    /// Port currently open for a probe; `ConnectingGuard` waits on it
+    /// (concurrent opens fail with os error 121 on Windows).
     probing_path: Option<String>,
 }
 
@@ -95,14 +67,12 @@ impl PortScanner {
         }
     }
 
-    /// Snapshot des ports actuellement connus (sans déclencher de scan).
     pub fn current_ports(&self) -> Vec<PortInfo> {
         let (lock, _) = &*self.state;
         let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         guard.last_ports.clone()
     }
 
-    /// Change le rythme de scan et réveille la boucle si elle dort.
     pub fn set_pace(&self, pace: ScanPace) {
         let (lock, cvar) = &*self.state;
         let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -110,8 +80,6 @@ impl PortScanner {
         cvar.notify_all();
     }
 
-    /// Force un scan immédiat (utile quand l'utilisateur ouvre le dropdown
-    /// pour ne pas attendre le prochain tick).
     pub fn trigger_refresh(&self) {
         let (lock, cvar) = &*self.state;
         let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -119,21 +87,7 @@ impl PortScanner {
         cvar.notify_all();
     }
 
-    /// Attend qu'aucun probe ne soit en cours sur `path`. Utilisé par
-    /// `serial_connect` avant d'ouvrir le port, pour éviter le conflit
-    /// d'ouverture concurrente avec le scanner (Windows os error 121).
-    ///
-    /// Poll toutes les 50 ms, plafonné à `max` (typiquement 2.5 s — le
-    /// probe lui-même est capé à 2 s). Au-delà, on rend la main : le
-    /// scanner doit gérer son propre cas, on ne bloque pas l'UX.
-    ///
-    /// Retourne `true` si un probe était actif et qu'on a effectivement
-    /// attendu (même une seule itération), `false` si le path était déjà
-    /// libre au premier coup d'œil. L'appelant utilise ce retour pour
-    /// décider d'un délai de grâce post-probe (le driver USB-CDC et le
-    /// firmware ont besoin de ~500 ms pour se calmer entre une fermeture
-    /// et la réouverture — sans ça, les premières écritures se prennent
-    /// des os error 121).
+    /// Waits up to `max` for any probe on `path` to end. Returns whether it waited.
     pub fn wait_probe_clear(&self, path: &str, max: Duration) -> bool {
         let (lock, _) = &*self.state;
         let deadline = Instant::now() + max;
@@ -153,8 +107,6 @@ impl PortScanner {
         }
     }
 
-    /// Spawn la boucle de scan. Ne retourne jamais (tourne jusqu'à l'arrêt
-    /// de l'app). Passé dans un `std::thread::spawn` au setup Tauri.
     pub fn spawn_loop(
         &self,
         app: AppHandle,
@@ -168,8 +120,6 @@ impl PortScanner {
     }
 }
 
-/// Boucle principale du scanner. `probe_cache` est local à la boucle — un
-/// seul thread y accède, pas de Mutex nécessaire.
 fn run_loop(
     state: Arc<(Mutex<ScannerState>, Condvar)>,
     app: AppHandle,
@@ -186,7 +136,6 @@ fn run_loop(
 
         let (new_ports, has_identifying) = scan_once(&mut probe_cache, &serial, &state);
 
-        // Diffusion si la liste a changé
         let changed = {
             let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
             let changed = !ports_equal(&guard.last_ports, &new_ports);
@@ -206,10 +155,7 @@ fn run_loop(
             );
         }
 
-        // Attendre le prochain tick (ou réveil anticipé via Condvar)
-        // Intervalle d'attente : tant qu'un port est en cours d'identification
-        // (`Retrying`), on tick plus vite pour coller au boot firmware. Sinon
-        // on suit le pace nominal (Active/Idle) piloté par l'UI.
+        // Tick faster while a port is still identifying, to catch the end of its boot.
         let interval = if has_identifying {
             IDENTIFYING_TICK
         } else {
@@ -226,15 +172,7 @@ fn run_loop(
     }
 }
 
-/// Réalise une passe : énumération, filtrage, probe des candidats non
-/// cachés. Retourne la liste enrichie et un flag `scanning` (toujours
-/// false en sortie — le spinner côté UI se pilote via `trigger_refresh`
-/// si on veut l'afficher pendant le scan, pas encore implémenté).
-/// Enrichit une liste énumérée sans ouvrir aucun port : on ne fait que
-/// rapatrier le firmware des ports déjà identifiés (`Success`) depuis le
-/// cache. Utilisé pendant le gel du scanner (session série active), où
-/// tout probe est interdit pour ne pas entrer en collision avec une autre
-/// application. Les ports inconnus restent tels quels (non identifiés).
+/// Fills firmware info from `Success` cache entries only, without opening any port.
 fn enrich_from_cache_only(
     ports: Vec<PortInfo>,
     cache: &HashMap<String, ProbeCacheEntry>,
@@ -258,44 +196,21 @@ fn scan_once(
     let ports = match list_ports_filtered() {
         Ok(p) => p,
         Err(e) => {
-            crate::log_warn(&format!("port_scanner: énumération échouée: {}", e));
+            crate::log_warn(&format!("port_scanner: enumeration failed: {}", e));
             return (Vec::new(), false);
         }
     };
 
-    // Purge les entrées de cache dont la clé (vid:pid:serial) n'est plus
-    // présente dans l'énumération courante. Ça couvre tous les cas de
-    // déconnexion :
-    //   - LFT qu'on débranche : `Success` dégagé. Au re-branchement, on
-    //     re-probe — essentiel car le firmware re-boot et ne répond pas
-    //     tant que son init radio n'est pas finie (on ne veut pas afficher
-    //     "LFT V1" depuis l'ancien cache et laisser l'utilisateur cliquer
-    //     sur un firmware pas prêt → os error 121 au connect).
-    //   - Port `Retrying` arraché : compteur remis à zéro au re-branchement.
-    //   - Port `Failure Busy` arraché : l'autre appli n'a plus le port
-    //     depuis qu'il est physiquement absent, on ne garde pas l'info.
+    // Forget unplugged ports: a replugged device reboots and must be re-probed,
+    // or the stale cache would offer a device not ready to connect yet.
     {
         let present: std::collections::HashSet<String> =
             ports.iter().map(cache_key).collect();
         cache.retain(|k, _| present.contains(k));
     }
 
-    // Gel des probes tant qu'une session série est active. Dès que le
-    // SerialManager est connecté (ou en cours de connexion) à un device,
-    // `busy_path()` est `Some` : on n'a plus besoin de chercher d'autres
-    // ports, et surtout on ne doit ouvrir AUCUN port — sinon le scanner
-    // entre en collision avec une autre application qui flashe un second
-    // ESP (esptool ouvre le port par à-coups, os error 121 des deux côtés).
-    //
-    // On continue malgré tout d'énumérer (métadonnées USB, sans ouverture)
-    // pour que le dropdown reste vivant : un device branché pendant la
-    // session apparaît, simplement sans identification firmware (on ne
-    // peut pas la faire sans ouvrir le port). Les ports déjà identifiés
-    // avant la connexion restent étiquetés via le cache `Success`.
-    //
-    // Le dégel est automatique : à la déconnexion (volontaire ou perte
-    // physique), `busy_path()` repasse à `None` et le scan reprend au tick
-    // suivant — pas de wiring supplémentaire côté `serial_disconnect`.
+    // No probing during a session: opening ports collides with other tools
+    // (esptool flashing a second ESP gets os error 121 on both sides).
     let connected = {
         let guard = serial.lock().unwrap_or_else(|p| p.into_inner());
         guard.busy_path().is_some()
@@ -316,12 +231,6 @@ fn scan_once(
 
         let key = cache_key(&port);
 
-        // Lecture cache. Trois états possibles :
-        //   Success : on a déjà identifié, on réutilise (permanent session).
-        //   Retrying : on a déjà essayé au moins une fois sans succès.
-        //              On ne retente que si `PROBE_RETRY_DELAY` écoulé depuis
-        //              la dernière tentative.
-        //   Failure : échec définitif, on skip jusqu'à expiration.
         match cache.get(&key).cloned() {
             Some(ProbeCacheEntry::Success(info)) => {
                 port.firmware = Some(info);
@@ -331,18 +240,12 @@ fn scan_once(
             Some(ProbeCacheEntry::Retrying { last_attempt, .. })
                 if now.duration_since(last_attempt) < PROBE_RETRY_DELAY =>
             {
-                // Trop tôt pour retenter, on laisse tel quel mais on signale
-                // à l'UI qu'on est en cours d'identification (spinner).
                 port.identifying = true;
                 has_identifying = true;
                 enriched.push(port);
                 continue;
             }
             Some(ProbeCacheEntry::Failure { until, reason }) if until > now => {
-                // Tant que le cache est chaud, on ré-émet le statut sans
-                // rouvrir le port. Pour `Busy`, c'est important : l'UI doit
-                // continuer à montrer "Utilisé par une autre application"
-                // à chaque tick.
                 if reason == FailureReason::Busy {
                     port.busy = true;
                 }
@@ -350,13 +253,11 @@ fn scan_once(
                 continue;
             }
             Some(ProbeCacheEntry::Failure { .. }) => {
-                // TTL Failure écoulé, on retente à zéro.
                 cache.remove(&key);
             }
             _ => {}
         }
 
-        // Skip si le port est utilisé par l'app (connect ou en cours).
         let busy_now = {
             let guard = serial.lock().unwrap_or_else(|p| p.into_inner());
             guard.busy_path().map(|s| s.to_string())
@@ -366,8 +267,6 @@ fn scan_once(
             continue;
         }
 
-        // Annonce qu'on ouvre ce port pour que `ConnectingGuard` puisse
-        // attendre sa libération avant d'ouvrir le même port côté connect.
         {
             let (lock, _) = &**state;
             let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -386,22 +285,17 @@ fn scan_once(
         match outcome {
             ProbeOutcome::Identified(info) => {
                 crate::log_info(&format!(
-                    "port_scanner: {} identifié: {:?} v{}",
+                    "port_scanner: {} identified: {:?} v{}",
                     port.path,
-                    info.profile,
+                    info.kind,
                     info.version.as_deref().unwrap_or("?")
                 ));
                 cache.insert(key, ProbeCacheEntry::Success(info.clone()));
                 port.firmware = Some(info);
             }
             ProbeOutcome::OpenFailed => {
-                // Port monopolisé par autre appli (ou disparu pile maintenant).
-                // Cache long, inutile de spammer. On marque le port `busy`
-                // pour que l'UI affiche un label dédié plutôt que le VID/PID
-                // générique — l'utilisateur comprend tout de suite pourquoi
-                // il ne peut pas s'y connecter.
                 crate::log_warn(&format!(
-                    "port_scanner: {} open échoué (occupé?), cache Failure {}s",
+                    "port_scanner: {} open failed (busy?), cached Failure {}s",
                     port.path,
                     PROBE_FAILURE_TTL.as_secs()
                 ));
@@ -415,9 +309,7 @@ fn scan_once(
                 port.busy = true;
             }
             ProbeOutcome::NoResponse => {
-                // Firmware pas encore prêt (hot-plug : init Wio-E5 qui peut
-                // prendre jusqu'à ~16 s avant que get_version soit traité).
-                // On retente jusqu'à PROBE_MAX_ATTEMPTS fois avant d'abandonner.
+                // Device still booting after hot-plug.
                 let prev_attempts = match cache.get(&key) {
                     Some(ProbeCacheEntry::Retrying { attempts, .. }) => *attempts,
                     _ => 0,
@@ -425,7 +317,7 @@ fn scan_once(
                 let attempts = prev_attempts + 1;
                 if attempts >= PROBE_MAX_ATTEMPTS {
                     crate::log_warn(&format!(
-                        "port_scanner: {} silencieux après {} tentatives, cache Failure {}s",
+                        "port_scanner: {} silent after {} attempts, cached Failure {}s",
                         port.path,
                         attempts,
                         PROBE_FAILURE_TTL.as_secs()
@@ -439,7 +331,7 @@ fn scan_once(
                     );
                 } else {
                     crate::log_debug(&format!(
-                        "port_scanner: {} pas de réponse (tentative {}/{}), retry dans {}ms",
+                        "port_scanner: {} no response (attempt {}/{}), retry in {}ms",
                         port.path,
                         attempts,
                         PROBE_MAX_ATTEMPTS,
@@ -464,11 +356,7 @@ fn scan_once(
     (enriched, has_identifying)
 }
 
-/// Deux listes sont égales si mêmes paths + mêmes flags d'état visibles
-/// à l'UI (`identifying`, `busy`, `firmware`). Les autres champs
-/// (manufacturer, product, etc.) sont stables pour un device donné — on
-/// les ignore pour éviter les faux positifs qui feraient re-render l'UI
-/// sans changement perceptible.
+/// Compares only what the UI shows; other USB fields can be reformatted by the OS.
 fn ports_equal(a: &[PortInfo], b: &[PortInfo]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -485,7 +373,7 @@ fn firmware_eq(a: Option<&PortFirmwareInfo>, b: Option<&PortFirmwareInfo>) -> bo
     match (a, b) {
         (None, None) => true,
         (Some(x), Some(y)) => {
-            x.profile == y.profile
+            x.kind == y.kind
                 && x.product == y.product
                 && x.model == y.model
                 && x.version == y.version
@@ -495,12 +383,12 @@ fn firmware_eq(a: Option<&PortFirmwareInfo>, b: Option<&PortFirmwareInfo>) -> bo
 }
 
 // ============================================================
-// Énumération + filtrage (déplacés depuis commands.rs)
+// Enumeration and filtering
 // ============================================================
 
 fn list_ports_filtered() -> Result<Vec<PortInfo>, String> {
     let ports = serialport::available_ports()
-        .map_err(|e| format!("Enumeration ports echouee: {}", e))?;
+        .map_err(|e| format!("Port enumeration failed: {}", e))?;
 
     let mut result: Vec<PortInfo> = ports
         .iter()
@@ -543,13 +431,12 @@ fn port_to_info(p: &serialport::SerialPortInfo) -> PortInfo {
     }
 }
 
-/// VID candidat au probe (Espressif uniquement — seul à parler le protocole LFT).
+/// Only Espressif ports are probed.
 fn is_candidate_vid(vid: &str) -> bool {
     vid.eq_ignore_ascii_case("303A")
 }
 
-/// VID affichés dans la liste (bridges série connus). Filtre les ports
-/// Bluetooth/PCI/etc. qui ne peuvent pas porter un LFT.
+/// Known USB-serial bridges shown in the list.
 fn is_displayable_vid(vid: &str) -> bool {
     matches!(
         vid.to_uppercase().as_str(),
@@ -566,69 +453,37 @@ fn port_sort_key(path: &str) -> u32 {
 }
 
 // ============================================================
-// Cache probe (déplacé depuis commands.rs)
+// Probe cache
 // ============================================================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureReason {
-    /// Port monopolisé par une autre application : open échoue immédiatement.
+    /// Held by another application.
     Busy,
-    /// Firmware ne répond pas après `PROBE_MAX_ATTEMPTS`. Probablement pas un LFT.
+    /// No reply after `PROBE_MAX_ATTEMPTS`; probably not a Link-LR.
     Unresponsive,
 }
 
 #[derive(Clone)]
 enum ProbeCacheEntry {
-    /// Identification réussie, conservée pour toute la session (un LFT qui
-    /// répond à un moment répondra au suivant — on ne re-probe jamais).
+    /// Kept until the port is unplugged.
     Success(PortFirmwareInfo),
-    /// Pas encore identifié. `attempts` compte les `NoResponse` consécutifs,
-    /// `last_attempt` permet d'espacer les tentatives via `PROBE_RETRY_DELAY`.
-    /// Quand `attempts` atteint `PROBE_MAX_ATTEMPTS`, bascule en `Failure`.
     Retrying { attempts: u32, last_attempt: Instant },
-    /// Échec définitif (port monopolisé ou `NoResponse` épuisé). Cache long
-    /// pour ne pas spammer un port qui ne va visiblement pas répondre. La
-    /// raison permet à l'UI de différencier "busy" (affichage dédié) d'un
-    /// port qui a juste refusé de parler (on le laisse en générique).
     Failure { until: Instant, reason: FailureReason },
 }
 
-/// Cache un échec "définitif" pendant 15 s. Pertinent dans deux cas :
-///   1. Port monopolisé par une autre application (Arduino IDE, PuTTY, …) :
-///      ouvrir le port échoue instantanément, inutile d'insister chaque tick.
-///      15 s laisse une fenêtre courte pour détecter la libération.
-///   2. Max tentatives `NoResponse` épuisées : si un port candidat VID 303A
-///      n'a pas répondu après `PROBE_MAX_ATTEMPTS` passages espacés de
-///      `PROBE_RETRY_DELAY`, ce n'est probablement pas un LFT, on se calme.
 const PROBE_FAILURE_TTL: Duration = Duration::from_secs(15);
 
-/// Timeout de la fenêtre d'écoute dans `probe_port_firmware`. Court
-/// volontairement : un LFT prêt répond en quelques ms, on n'a pas besoin
-/// d'attendre. Au hot-plug (firmware pas prêt), c'est le retry qui couvre
-/// le boot via plusieurs tentatives rapprochées.
+/// A ready device answers in a few ms; retries cover the boot after hot-plug.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Nombre de tentatives `NoResponse` consécutives avant de passer en cache
-/// Failure long. Avec `PROBE_RETRY_DELAY` 500 ms et un timeout de 2 s, on
-/// couvre une fenêtre de ~40 s — largement au-delà de l'init complète du
-/// firmware LFT (vu en test à ~16 s pour le get_version qui n'est dispo
-/// qu'après init radio).
+/// ~40 s of retries, well past the device's boot time.
 const PROBE_MAX_ATTEMPTS: u32 = 15;
 
-/// Délai minimal entre deux tentatives `NoResponse` sur le même port. Court
-/// pour coller au plus près du boot firmware : quand celui-ci bascule en
-/// "prêt", on l'identifie sans latence superflue.
 const PROBE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-/// Intervalle d'attente entre deux ticks tant qu'au moins un port est en
-/// cours d'identification (`Retrying`). Quand tous les ports sont tranchés,
-/// on retombe sur le pace nominal (Active/Idle). Évite d'attendre 2-5 s
-/// entre deux tentatives alors que le firmware est peut-être prêt.
 const IDENTIFYING_TICK: Duration = Duration::from_millis(500);
 
-/// Résultat d'un probe, permettant de différencier un port monopolisé
-/// (fermé d'office par l'OS) d'un port ouvert mais silencieux (firmware
-/// pas encore prêt). Les deux se cachent différemment.
 #[derive(Debug)]
 enum ProbeOutcome {
     Identified(PortFirmwareInfo),
@@ -640,13 +495,6 @@ fn cache_key(port: &PortInfo) -> String {
     format!("{}:{}:{}", port.vid, port.pid, port.serial_number)
 }
 
-/// Probe un port : ouvre, désactive DTR/RTS, envoie get_version, lit jusqu'à
-/// `PROBE_TIMEOUT`. Distingue trois issues :
-///   - `Identified` : firmware LFT a répondu, on a l'info.
-///   - `OpenFailed` : port monopolisé par une autre app ou disparu — l'open
-///     a échoué immédiatement, inutile d'insister.
-///   - `NoResponse` : port ouvert mais silencieux (firmware pas encore prêt
-///     sur hot-plug, device inconnu, etc.).
 fn probe_port_firmware(port_name: &str) -> ProbeOutcome {
     let t0 = Instant::now();
 
@@ -705,7 +553,7 @@ fn probe_port_firmware(port_name: &str) -> ProbeOutcome {
                 }) = serde_json::from_str::<DeviceMessage>(trimmed)
                 {
                     if c == "get_version" {
-                        let profile = FirmwareProfile::from_version_ack(
+                        let kind = DeviceKind::from_version_ack(
                             product.as_deref(),
                             model.as_deref(),
                         );
@@ -716,7 +564,7 @@ fn probe_port_firmware(port_name: &str) -> ProbeOutcome {
                             lines_seen
                         ));
                         return ProbeOutcome::Identified(PortFirmwareInfo {
-                            profile,
+                            kind,
                             product: product.clone(),
                             model: model.clone(),
                             version: version.clone(),
@@ -764,9 +612,9 @@ mod tests {
         let a = make_port();
         let mut b = a.clone();
         b.firmware = Some(PortFirmwareInfo {
-            profile: FirmwareProfile::LftV1,
-            product: Some("LFT".into()),
-            model: Some("v1".into()),
+            kind: DeviceKind::LinkLr,
+            product: Some("Link".into()),
+            model: Some("Link-LR".into()),
             version: Some("0.2.3".into()),
             mac: None,
         });
@@ -777,9 +625,6 @@ mod tests {
 
     #[test]
     fn ports_equal_ignores_product_label() {
-        // Un changement de `product` côté driver OS ne compte pas comme
-        // un changement — seul path + firmware + identifying comptent. Évite
-        // les emits parasites quand Windows reformate la chaîne USB descriptor.
         let a = make_port();
         let mut b = a.clone();
         b.product = "P2".into();
@@ -788,8 +633,6 @@ mod tests {
 
     #[test]
     fn ports_equal_detects_identifying_change() {
-        // Quand le flag identifying bascule (Retrying → Success/Failure),
-        // l'UI doit être notifiée pour retirer/afficher le spinner.
         let a = make_port();
         let mut b = a.clone();
         b.identifying = true;
@@ -798,9 +641,6 @@ mod tests {
 
     #[test]
     fn ports_equal_detects_busy_change() {
-        // Quand le flag busy bascule (port libéré par l'autre app après
-        // expiration du cache Failure), l'UI doit retirer le label
-        // "Utilisé par une autre application".
         let a = make_port();
         let mut b = a.clone();
         b.busy = true;
@@ -815,14 +655,11 @@ mod tests {
 
     #[test]
     fn enrich_from_cache_reuses_success_without_probe() {
-        // Session active (scanner gelé) : un port déjà identifié doit
-        // ressortir avec son firmware repris du cache `Success`, sans
-        // qu'aucune ouverture de port ne soit nécessaire.
         let port = make_port();
         let info = PortFirmwareInfo {
-            profile: FirmwareProfile::LftV1,
-            product: Some("LFT".into()),
-            model: Some("v1".into()),
+            kind: DeviceKind::LinkLr,
+            product: Some("Link".into()),
+            model: Some("Link-LR".into()),
             version: Some("0.2.3".into()),
             mac: None,
         };
@@ -836,9 +673,6 @@ mod tests {
 
     #[test]
     fn enrich_from_cache_leaves_unknown_ports_untouched() {
-        // Pendant le gel, un port absent du cache (jamais identifié, ou
-        // en `Retrying`/`Failure`) ressort tel quel : pas de firmware, pas
-        // de flag modifié — on ne l'ouvre pas pour l'identifier.
         let port = make_port();
         let cache = HashMap::new();
         let out = enrich_from_cache_only(vec![port.clone()], &cache);
@@ -849,9 +683,6 @@ mod tests {
 
     #[test]
     fn busy_path_drives_freeze_decision() {
-        // Le gel est piloté par `busy_path()` du SerialManager : `None`
-        // quand libre (scan normal), `Some` dès qu'on amorce une connexion
-        // (gel). Garantit que le scanner cesse tout probe en session.
         let mut mgr = SerialManager::new();
         assert!(mgr.busy_path().is_none());
         mgr.begin_connecting("COM3");

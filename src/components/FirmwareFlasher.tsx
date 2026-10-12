@@ -13,14 +13,13 @@ export function FirmwareFlasher() {
     flashFirmwareFromPath,
   } = useFirmwareUpdater();
 
-  // Recuperer la version au montage
   useEffect(() => {
     fetchDeviceVersion();
   }, [fetchDeviceVersion]);
 
   const handlePickAndFlash = useCallback(async () => {
     const path = await open({
-      title: 'Choisir un firmware (.bin)',
+      title: 'Select firmware (.bin)',
       filters: [{ name: 'Firmware', extensions: ['bin'] }],
       multiple: false,
       directory: false,
@@ -43,7 +42,7 @@ export function FirmwareFlasher() {
         disabled={isFlashing}
         className="w-full px-3 py-2 text-sm rounded-element border border-border text-text-secondary hover:text-brand hover:border-brand hover:bg-brand-50 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200"
       >
-        {isFlashing ? 'Mise a jour en cours...' : 'Flash firmware (.bin)'}
+        {isFlashing ? 'Updating…' : 'Flash firmware (.bin)'}
       </button>
 
       {isFlashing && (
@@ -55,16 +54,16 @@ export function FirmwareFlasher() {
             />
           </div>
           <p className="text-[11px] text-text-muted">
-            {flashStatus === 'checking' && 'Verification du device...'}
+            {flashStatus === 'checking' && 'Checking device…'}
             {flashStatus === 'flashing' && `${Math.round(flashProgress)}%`}
-            {flashStatus === 'rebooting' && 'Redemarrage du LFT...'}
+            {flashStatus === 'rebooting' && 'Restarting the device…'}
           </p>
         </div>
       )}
 
       {flashStatus === 'done' && (
         <p className="text-[11px] text-rssi-good">
-          Firmware mis a jour{deviceVersion ? ` (${deviceVersion})` : ''}
+          Firmware updated{deviceVersion ? ` (${deviceVersion})` : ''}
         </p>
       )}
 

@@ -8,16 +8,8 @@ use tauri::ipc::Channel;
 use tauri::State;
 use uuid::Uuid;
 
-/// RAII : marque le port comme "en cours d'ouverture" sur le SerialManager
-/// le temps que `serial_connect` tourne. Le port_scanner skip ce path tant
-/// que le guard existe, ce qui empêche une tentative d'ouverture parallèle
-/// du même COM (Windows → os error 121). Le drop relâche le flag, même
-/// en cas de panic ou de retour précoce.
-///
-/// À la création, si le scanner est en train de probe ce même port, on
-/// attend (max 2.5 s) qu'il relâche le handle. Sans cette attente, les
-/// deux ouvertures se chevauchent et `serial_connect` boucle sur os
-/// error 121 jusqu'à ce que le probe termine de son côté.
+/// Marks the port as connecting so the scanner won't probe it: two opens of
+/// the same COM port fail with os error 121 on Windows.
 struct ConnectingGuard {
     state: Arc<Mutex<SerialManager>>,
 }
@@ -28,15 +20,13 @@ impl ConnectingGuard {
         scanner: &PortScanner,
         port_name: &str,
     ) -> Self {
-        // Attend que le scanner ait fini son probe ET que son délai post-probe
-        // soit écoulé (le kernel Windows ne libère pas le handle instantanément
-        // au Drop — le scanner tient `probing_path` jusqu'à ce que le handle
-        // soit réellement libre).
+        // Windows releases the handle some time after Drop; the scanner holds
+        // `probing_path` until it is really free.
         let waited = scanner
             .wait_probe_clear(port_name, std::time::Duration::from_millis(3000));
         if waited {
             log_info(&format!(
-                "serial_connect: attendu fin probe sur {}",
+                "serial_connect: waited for probe to finish on {}",
                 port_name
             ));
         }
@@ -56,21 +46,16 @@ impl Drop for ConnectingGuard {
     }
 }
 
-/// SAFETY (F3): On utilise std::sync::Mutex (pas tokio::sync::Mutex) car toutes les
-/// commandes Tauri sont synchrones (#[tauri::command] sans async). Le risque de deadlock
-/// async n'existe pas. send_command_safe() garantit le pattern lock-write-drop-wait.
+/// std Mutex: never held across an await, and send_command_safe releases it
+/// before waiting for the reply.
 type SharedManager = Arc<Mutex<SerialManager>>;
 
-/// Recupere le MutexGuard sans paniquer en cas de mutex empoisonne (F1).
 fn lock_mgr(state: &SharedManager) -> Result<std::sync::MutexGuard<'_, SerialManager>, String> {
     state
         .lock()
-        .map_err(|_| "Mutex empoisonne — redemarrez l'application".to_string())
+        .map_err(|_| "Mutex poisoned, restart the application".to_string())
 }
 
-/// Renvoie l'OS hôte sous forme de chaîne stable consommable côté frontend
-/// (ex. pour adapter les messages d'erreur localisés selon la plateforme).
-/// Valeurs : "windows" | "macos" | "linux" | "other".
 #[tauri::command]
 pub fn get_platform() -> &'static str {
     if cfg!(target_os = "windows") { "windows" }
@@ -90,23 +75,14 @@ pub fn serial_connect(
     let baud = baud_rate.unwrap_or(115200);
     let state_clone = state.inner().clone();
 
-    // RAII guard : attend la fin d'un éventuel probe en cours sur ce port,
-    // puis marque le port "en cours d'ouverture". Garantit qu'aucun handle
-    // concurrent ne traîne côté scanner au moment où on appelle `mgr.connect`.
     let _connecting_guard =
         ConnectingGuard::new(state.inner().clone(), scanner.inner(), &port_name);
 
-    // Helper local : convertit une String d'erreur "secondaire" (lock,
-    // get_config échoué, etc.) en ConnectError::Other, le code commun
-    // pour les erreurs post-open. Le frontend les affichera via le
-    // mapping standard.
     let other = |raw: String| ConnectError::Other {
         port: port_name.clone(),
         raw,
     };
 
-    // Copie du channel pour envoyer l'event Firmware après identification.
-    // La Channel Tauri est Clone — elle enregistre juste le même callback côté JS.
     let event_channel = on_event.clone();
 
     {
@@ -117,26 +93,53 @@ pub fn serial_connect(
         }
     }
 
-    // Délai de stabilisation après l'ouverture du port :
-    //   - Le driver USB-série Windows peut continuer à émettre des
-    //     pulses DTR/RTS pendant ~100 ms après l'ouverture
-    //   - Le firmware ESP32 finit son init reader_thread + buffer flush
-    // Sans ce délai, la première commande envoyée peut tomber dans la
-    // fenêtre où le firmware n'est pas encore prêt à parser, et timeout.
-    // Cohérent avec le délai déjà présent dans auto_setup après probe_port.
+    // The Windows USB-serial driver may pulse DTR/RTS for ~100 ms after open;
+    // a command sent earlier can be lost and time out.
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // Recuperer la config initiale. Retry agressif (6 tentatives) car
-    // si l'utilisateur clique pour se connecter pendant que le firmware
-    // est en cours de boot (cas typique : branchement USB juste avant le
-    // clic), les premières écritures rejettent immédiatement avec
-    // os error 121 ("device pas prêt"). Avec 1s de délai entre chaque,
-    // on couvre ~6-7s de boot firmware avant d'abandonner.
+    // Six tries, 1 s apart: a device plugged in just before the click is
+    // still booting and refuses writes with os error 121.
+    let firmware_info = match identify(state.inner()) {
+        Ok(info) => info,
+        Err(e) => {
+            log_error(&format!("Connect failed port={}: get_version error: {}", port_name, e));
+            if let Ok(mut mgr) = state.inner().lock() {
+                mgr.disconnect();
+            }
+            return Err(other(format!("get_version: {}", e)));
+        }
+    };
+    if firmware_info.kind != DeviceKind::LinkLr {
+        log_warn(&format!(
+            "Connect refused port={}: product={:?} model={:?}",
+            port_name, firmware_info.product, firmware_info.model
+        ));
+        if let Ok(mut mgr) = state.inner().lock() {
+            mgr.disconnect();
+        }
+        return Err(ConnectError::UnsupportedDevice {
+            port: port_name.clone(),
+            raw: format!(
+                "{} {}",
+                firmware_info.product.as_deref().unwrap_or("?"),
+                firmware_info.model.as_deref().unwrap_or("?")
+            ),
+            kind: firmware_info.kind,
+        });
+    }
+    let _ = event_channel.send(SerialEvent::Firmware(firmware_info.clone()));
+    log_info(&format!(
+        "Connect port={} OK model={} version={}",
+        port_name,
+        firmware_info.model.as_deref().unwrap_or("?"),
+        firmware_info.version.as_deref().unwrap_or("?")
+    ));
+
     let cmd = SerialCommand {
         cmd: "get_config".to_string(),
         value: None,
     };
-    let resp = match SerialManager::send_command_safe_with_retries(state.inner(), cmd, 6) {
+    let resp = match SerialManager::send_command_safe(state.inner(), cmd) {
         Ok(r) => r,
         Err(e) => {
             log_error(&format!("Connect failed port={}: get_config error: {}", port_name, e));
@@ -179,100 +182,51 @@ pub fn serial_connect(
         }
     };
 
-    // --- Identification firmware (best-effort) ---
-    // Le firmware legacy répond aussi à get_version mais sans product/model,
-    // le profil sera alors Legacy. En cas de timeout (peu probable), on
-    // suppose Legacy par défaut — aucune fonctionnalité V1 ne sera activée,
-    // comportement sûr.
-    let firmware_info = probe_firmware(state.inner());
-    {
-        let mut mgr = lock_mgr(state.inner()).map_err(&other)?;
-        mgr.firmware_profile = Some(firmware_info.profile);
-    }
-    let _ = event_channel.send(SerialEvent::Firmware(firmware_info.clone()));
-
-    log_info(&format!(
-        "Connect port={} OK profile={:?} version={}",
-        port_name,
-        firmware_info.profile,
-        firmware_info.version.as_deref().unwrap_or("?")
-    ));
-
-    // La sync heure est déclenchée côté React (besoin de l'offset local JS
-    // qu'on n'a pas facilement en Rust sans dépendance chrono). Le frontend
-    // appelle `sync_time` après avoir reçu l'event SerialEvent::Firmware si
-    // profile == LftV1.
+    // The frontend calls `sync_time` on the Firmware event: the local
+    // offset is easier to read in JS.
 
     Ok(config)
 }
 
-/// Récupère la version firmware et en déduit le profil. En cas d'échec
-/// (timeout, réponse inattendue), retourne Legacy — fallback le plus sûr.
-fn probe_firmware(state: &SharedManager) -> FirmwareInfo {
+fn identify(state: &SharedManager) -> Result<FirmwareInfo, String> {
     let cmd = SerialCommand {
         cmd: "get_version".to_string(),
         value: None,
     };
-    match SerialManager::send_command_safe_with_retries(state, cmd, 1) {
-        Ok(DeviceMessage::Ack {
+    match SerialManager::send_command_safe_with_retries(state, cmd, 6)? {
+        DeviceMessage::Ack {
             version,
             build_date,
             product,
             model,
             mac,
             ..
-        }) => {
-            let profile = FirmwareProfile::from_version_ack(
-                product.as_deref(),
-                model.as_deref(),
-            );
-            FirmwareInfo {
-                profile,
-                product,
-                model,
-                version,
-                build_date,
-                mac,
-            }
-        }
-        _ => FirmwareInfo {
-            profile: FirmwareProfile::Legacy,
-            product: None,
-            model: None,
-            version: None,
-            build_date: None,
-            mac: None,
-        },
+        } => Ok(FirmwareInfo {
+            kind: DeviceKind::from_version_ack(product.as_deref(), model.as_deref()),
+            product,
+            model,
+            version,
+            build_date,
+            mac,
+        }),
+        _ => Err("unexpected reply".to_string()),
     }
 }
 
-/// Structure retournée par `sync_time` pour que React puisse afficher la
-/// situation rencontrée (pour debug/log, pas forcément affiché à l'utilisateur).
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeSyncResult {
-    /// true si le LFT était déjà valide et à l'heure (pas de set_time envoyé).
+    /// Clock already valid and on time: no set_time sent.
     pub was_in_sync: bool,
-    /// Dérive mesurée en secondes (device - pc). 0 si device pas valide.
+    /// |device - pc| in seconds; 0 if the device clock was invalid.
     pub drift_s: f64,
-    /// true si le device rapportait valid=false (RTC jamais configurée).
+    /// Device reported valid=false (RTC never set).
     pub was_invalid: bool,
-    /// true si un set_time a été envoyé et ack.
     pub did_sync: bool,
 }
 
-/// Sync heure côté LFT V1. Appelé par React après identification firmware.
-///
-/// Paramètres:
-/// - `utc`: epoch UTC actuel en secondes (Math.floor(Date.now()/1000) côté JS)
-/// - `offset_min`: offset local PC en minutes (`-new Date().getTimezoneOffset()`)
-///
-/// Logique (Q2+Q3 validés utilisateur) :
-/// - Si device `valid=false` (RTC pas configurée) : force la sync sans condition.
-/// - Sinon si dérive > 30 s : sync silencieuse.
-/// - Sinon : no-op.
-///
-/// Sécurité : rien ne se passe si profil != LftV1. Tout échec est silencieux.
+/// Sets the device clock if it is invalid or drifts more than 30 s.
+/// Called by the frontend once the device is identified.
 #[tauri::command]
 pub fn sync_time(
     state: State<'_, SharedManager>,
@@ -281,20 +235,6 @@ pub fn sync_time(
 ) -> Result<TimeSyncResult, String> {
     const DRIFT_THRESHOLD_S: f64 = 30.0;
 
-    // Garde-fou : ne rien faire si pas LFT V1.
-    {
-        let mgr = lock_mgr(state.inner())?;
-        if mgr.firmware_profile != Some(FirmwareProfile::LftV1) {
-            return Ok(TimeSyncResult {
-                was_in_sync: true,
-                drift_s: 0.0,
-                was_invalid: false,
-                did_sync: false,
-            });
-        }
-    }
-
-    // 1) get_time
     let resp = SerialManager::send_command_safe(
         state.inner(),
         SerialCommand {
@@ -305,7 +245,7 @@ pub fn sync_time(
 
     let (device_utc, device_valid) = match resp {
         DeviceMessage::Time { utc, valid, .. } => (utc, valid.unwrap_or(false)),
-        _ => return Err("Reponse inattendue a get_time".to_string()),
+        _ => return Err("Unexpected reply to get_time".to_string()),
     };
 
     let drift_s = if device_valid {
@@ -325,7 +265,7 @@ pub fn sync_time(
         });
     }
 
-    // 2) set_time avec offset (JSON custom — SerialCommand ne supporte qu'une valeur)
+    // Raw JSON: SerialCommand carries a single value.
     let set_time_json = serde_json::json!({
         "cmd": "set_time",
         "utc": utc,
@@ -355,11 +295,11 @@ pub fn sync_time(
         }
         DeviceMessage::Error { msg, .. } => {
             log_error(&format!("Time sync failed: {}", msg));
-            Err(format!("set_time rejeté: {}", msg))
+            Err(format!("set_time rejected: {}", msg))
         }
         _ => {
             log_error("Time sync: unexpected response");
-            Err("set_time reponse inattendue".to_string())
+            Err("Unexpected reply to set_time".to_string())
         }
     }
 }
@@ -372,33 +312,31 @@ pub fn serial_disconnect(state: State<'_, SharedManager>) -> Result<(), String> 
     Ok(())
 }
 
-/// F11: Validation basique des plages pour les commandes set_*.
-/// La validation definitive est faite par le firmware (device-side backstop),
-/// mais on rejette les valeurs manifestement incorrectes cote PC.
+/// Coarse range check; the firmware does the real validation.
 fn validate_command_value(cmd: &str, value: Option<f64>) -> Result<(), String> {
     let v = match value {
         Some(v) => v,
-        None => return Ok(()), // pas de valeur a valider (ex: get_config)
+        None => return Ok(()),
     };
 
     match cmd {
         "set_freq" => {
             if !(150.0..=960.0).contains(&v) {
-                return Err(format!("Frequence hors plage (150-960 MHz): {}", v));
+                return Err(format!("Frequency out of range (150-960 MHz): {}", v));
             }
         }
         "set_sf" => {
             let sf = v as u8;
             if !SPREADING_FACTORS.contains(&sf) {
-                return Err(format!("SF invalide (6-12): {}", v));
+                return Err(format!("Invalid SF (6-12): {}", v));
             }
         }
         "set_bw" => {
             if !VALID_BANDWIDTHS.contains(&v) {
-                return Err(format!("Bandwidth invalide: {}", v));
+                return Err(format!("Invalid bandwidth: {}", v));
             }
         }
-        _ => {} // get_config, etc. — pas de validation necessaire
+        _ => {}
     }
     Ok(())
 }
@@ -409,16 +347,13 @@ pub fn send_command(
     cmd: String,
     value: Option<f64>,
 ) -> Result<serde_json::Value, String> {
-    // Bloquer les commandes réservées aux flows internes (set_time / get_time
-    // passent par sync_time, pas send_command).
     if !VALID_COMMANDS.contains(&cmd.as_str()) {
-        return Err(format!("Commande non exposée au frontend: {}", cmd));
+        return Err(format!("Command not exposed to the frontend: {}", cmd));
     }
-    // F11: valider avant d'envoyer
     validate_command_value(&cmd, value)?;
     let command = SerialCommand { cmd, value };
     let response = SerialManager::send_command_safe(state.inner(), command)?;
-    serde_json::to_value(&response).map_err(|e| format!("Serialisation reponse echouee: {}", e))
+    serde_json::to_value(&response).map_err(|e| format!("Response serialization failed: {}", e))
 }
 
 #[tauri::command]
@@ -430,7 +365,7 @@ pub fn apply_config(
 ) -> Result<LoRaConfig, String> {
     let current = {
         let mgr = lock_mgr(state.inner())?;
-        mgr.config.clone().ok_or("Pas de config actuelle")?
+        mgr.config.clone().ok_or("No current config")?
     };
 
     let changes: Vec<SerialCommand> = [
@@ -456,8 +391,7 @@ pub fn apply_config(
         return Ok(current);
     }
 
-    // Envoyer chaque commande via send_command_safe (hors du lock)
-    // Best-effort : en cas d'echec partiel, refresh la config pour rester synchronise
+    // On partial failure, re-read the config so the cache matches the device.
     for cmd in &changes {
         let value_str = cmd.value.map(|v| format!("{}", v)).unwrap_or_default();
         let resp = match SerialManager::send_command_safe(state.inner(), cmd.clone()) {
@@ -465,18 +399,17 @@ pub fn apply_config(
             Err(e) => {
                 log_error(&format!("{} {} failed: {}", cmd.cmd, value_str, e));
                 let _ = refresh_config_from_device(state.inner());
-                return Err(format!("Erreur {}: {}", cmd.cmd, e));
+                return Err(format!("{} error: {}", cmd.cmd, e));
             }
         };
         if let DeviceMessage::Error { msg, .. } = resp {
             log_warn(&format!("{} {} rejected: {}", cmd.cmd, value_str, msg));
             let _ = refresh_config_from_device(state.inner());
-            return Err(format!("Erreur {}: {}", cmd.cmd, msg));
+            return Err(format!("{} error: {}", cmd.cmd, msg));
         }
         log_info(&format!("{} {} OK", cmd.cmd, value_str));
     }
 
-    // Rafraichir la config depuis le device
     let get_cmd = SerialCommand {
         cmd: "get_config".to_string(),
         value: None,
@@ -505,182 +438,26 @@ pub fn apply_config(
     }
 }
 
-/// F10: Auto-setup probe sequentiellement les ports — c'est intentionnel.
-/// Le crate serialport est bloquant (pas d'API async), et chaque port doit etre
-/// probe un par un car les ports serie ne supportent pas l'acces concurrent.
-/// La commande Tauri est synchrone, l'UI affiche un spinner pendant le probing.
-#[tauri::command]
-pub fn auto_setup(
-    state: State<'_, SharedManager>,
-    on_event: Channel<SerialEvent>,
-) -> Result<AutoSetupResult, String> {
-    let ports =
-        serialport::available_ports().map_err(|e| format!("Enumeration echouee: {}", e))?;
-
-    let mut found_port: Option<String> = None;
-
-    // Phase 1 : Probing leger — pas de reader thread
-    for port_info in &ports {
-        if probe_port(&port_info.port_name) {
-            found_port = Some(port_info.port_name.clone());
-            break;
-        }
-    }
-
-    let port_name = found_port.ok_or("Aucun appareil detecte")?;
-
-    // Windows USB-serial drivers need time to release the handle
-    // after probe_port closes it.
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Phase 2 : Vrai connect sur le port trouve
-    let state_clone = state.inner().clone();
-    {
-        let mut mgr = lock_mgr(state.inner())?;
-        mgr.connect(&port_name, 115200, on_event, state_clone)
-            .map_err(|e| e.to_string())?;
-    }
-
-    // Phase 3 : Appliquer config EU868 via send_command_safe
-    let commands = vec![
-        SerialCommand {
-            cmd: "set_freq".to_string(),
-            value: Some(868.1),
-        },
-        SerialCommand {
-            cmd: "set_sf".to_string(),
-            value: Some(7.0),
-        },
-        SerialCommand {
-            cmd: "set_bw".to_string(),
-            value: Some(125.0),
-        },
-    ];
-
-    for cmd in commands {
-        let resp = SerialManager::send_command_safe(state.inner(), cmd.clone())?;
-        if let DeviceMessage::Error { msg, .. } = resp {
-            let mut mgr = lock_mgr(state.inner())?;
-            mgr.disconnect();
-            return Err(format!("Auto-setup echoue sur {}: {}", cmd.cmd, msg));
-        }
-    }
-
-    // Sync heure : déléguée au frontend React qui appellera `sync_time`
-    // après identification firmware (besoin de l'offset local JS).
-
-    // Recuperer config finale
-    let resp = SerialManager::send_command_safe(
-        state.inner(),
-        SerialCommand {
-            cmd: "get_config".to_string(),
-            value: None,
-        },
-    )?;
-
-    match resp {
-        DeviceMessage::Config {
-            freq,
-            sf,
-            bw,
-            drops,
-        } => {
-            let prev = LoRaConfig {
-                freq: 868.0,
-                sf: 7,
-                bw: 125.0,
-                drops: 0,
-            };
-            let config = LoRaConfig {
-                freq: freq.unwrap_or(prev.freq),
-                sf: sf.unwrap_or(prev.sf),
-                bw: bw.unwrap_or(prev.bw),
-                drops: drops.unwrap_or(prev.drops),
-            }.sanitized();
-            let mut mgr = lock_mgr(state.inner())?;
-            mgr.config = Some(config.clone());
-            Ok(AutoSetupResult {
-                config,
-                port: port_name,
-            })
-        }
-        _ => Err("Config EU868 echouee".to_string()),
-    }
-}
-
 // ============================================================
-// Port scan — nouvelles commandes
-//
-// La logique de scan (énumération, probe, cache, diffusion) vit dans
-// `port_scanner.rs`. Ici on expose juste les commandes Tauri que React
-// appelle pour piloter le rythme et lire l'état courant. La diffusion
-// des changements passe par l'event Tauri `ports_changed` (voir le
-// module `port_scanner`).
+// Port scan (logic in port_scanner.rs; changes go out on `ports_changed`)
 // ============================================================
 
-/// Snapshot synchrone de la dernière liste de ports connue (enrichie).
-/// Utilisé au mount de React pour afficher l'état sans attendre un event.
 #[tauri::command]
 pub fn get_current_ports(scanner: State<'_, Arc<PortScanner>>) -> Vec<PortInfo> {
     scanner.current_ports()
 }
 
-/// Change le rythme de scan : `active=true` → 2 s (dropdown ouvert),
-/// `active=false` → 5 s (veille). Réveille la boucle immédiatement.
 #[tauri::command]
 pub fn set_scan_pace(scanner: State<'_, Arc<PortScanner>>, active: bool) {
     let pace = if active { ScanPace::Active } else { ScanPace::Idle };
     scanner.set_pace(pace);
 }
 
-/// Force un scan immédiat sans attendre le prochain tick. Utile quand
-/// l'utilisateur ouvre le dropdown pour rafraîchir l'identification
-/// d'un port juste branché.
 #[tauri::command]
 pub fn refresh_ports_now(scanner: State<'_, Arc<PortScanner>>) {
     scanner.trigger_refresh();
 }
 
-/// Probe un port sans spawner de reader thread.
-/// Lit jusqu'a 5 lignes pour tolerer les bannieres firmware (boot logs, etc.)
-/// Verifie specifiquement que la reponse est un Config.
-fn probe_port(port_name: &str) -> bool {
-    let port = serialport::new(port_name, 115200)
-        .timeout(std::time::Duration::from_millis(500))
-        .open();
-
-    let mut port = match port {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-
-    let cmd = r#"{"cmd":"get_config"}"#;
-    if port
-        .write_all(format!("{}\n", cmd).as_bytes())
-        .is_err()
-    {
-        return false;
-    }
-    let _ = port.flush();
-
-    let mut reader = std::io::BufReader::new(&mut port);
-    for _ in 0..5 {
-        let mut line = String::new();
-        match std::io::BufRead::read_line(&mut reader, &mut line) {
-            Ok(n) if n > 0 => {
-                if let Ok(DeviceMessage::Config { .. }) =
-                    serde_json::from_str::<DeviceMessage>(line.trim())
-                {
-                    return true;
-                }
-            }
-            _ => return false,
-        }
-    }
-    false
-}
-
-/// Rafraichit la config depuis le device apres echec partiel.
 fn refresh_config_from_device(state: &SharedManager) {
     if let Ok(DeviceMessage::Config {
         freq,
@@ -748,7 +525,7 @@ pub fn load_capture(
         .iter()
         .map(|f| {
             let ts_raw = f.get("timestamp").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            // Normaliser timestamp : si > 1e12 c'est en ms, sinon en secondes
+            // Above 1e12 the timestamp is in ms.
             let timestamp = if ts_raw > 1e12 {
                 ts_raw / 1000.0
             } else {
@@ -788,7 +565,6 @@ pub fn get_valid_params() -> serde_json::Value {
 // Firmware update commands
 // ============================================================
 
-/// Retourne la version firmware du device connecte, ou null si non supporte.
 #[tauri::command]
 pub fn get_device_version(
     state: State<'_, SharedManager>,
@@ -798,7 +574,7 @@ pub fn get_device_version(
         mgr.is_connected()
     };
     if !is_connected {
-        return Err("Non connecte".to_string());
+        return Err("Not connected".to_string());
     }
     let cmd = SerialCommand {
         cmd: "get_version".to_string(),
@@ -845,7 +621,7 @@ fn flash_firmware_blocking(
 
     // Read firmware binary
     let firmware_data = std::fs::read(&path)
-        .map_err(|e| format!("Lecture firmware echouee: {}", e))?;
+        .map_err(|e| format!("Firmware read failed: {}", e))?;
     let total_size = firmware_data.len() as u64;
 
     // Compute SHA256
@@ -878,7 +654,7 @@ fn flash_firmware_blocking(
     )?;
 
     if let DeviceMessage::Error { msg, .. } = resp {
-        return Err(format!("ota_begin echoue: {}", msg));
+        return Err(format!("ota_begin failed: {}", msg));
     }
 
     // Phase 2: send chunks
@@ -904,7 +680,7 @@ fn flash_firmware_blocking(
         )?;
 
         if let DeviceMessage::Error { msg, .. } = resp {
-            return Err(format!("ota_data echoue (chunk {}): {}", seq, msg));
+            return Err(format!("ota_data failed (chunk {}): {}", seq, msg));
         }
 
         bytes_sent += chunk.len() as u64;
@@ -928,7 +704,7 @@ fn flash_firmware_blocking(
     )?;
 
     if let DeviceMessage::Error { msg, .. } = resp {
-        return Err(format!("ota_end echoue: {}", msg));
+        return Err(format!("ota_end failed: {}", msg));
     }
 
     // Phase 4: reboot
@@ -957,27 +733,14 @@ fn flash_firmware_blocking(
     Ok(())
 }
 
-/// Récupère le journal système stocké par le firmware.
-///
-/// Envoie `{"cmd":"get_events"}` et collecte le stream :
-///   1. `{"type":"ack","cmd":"get_events","phase":"begin"}`
-///   2. N × `{"type":"event","line":"...","seq":N}`
-///   3. `{"type":"ack","cmd":"get_events","phase":"end","count":N}`
-///
-/// Retourne la liste ordonnée des lignes de log. Le parsing timestamp /
-/// event / details est laissé au frontend pour flexibilité d'affichage.
-///
-/// Timeouts : 5 s entre chaque message reçu. Un log complet de 800 lignes
-/// passe largement dans cette fenêtre (streamer lent : 1 ligne = quelques
-/// ms côté firmware). Sur timeout ou erreur, le collecteur est nettoyé
-/// pour ne pas bloquer une future commande.
+/// Reads the device log: ack phase=begin, N event lines, ack phase=end.
+/// The collector is cleared on any error so it can't block later commands.
 #[tauri::command]
 pub fn get_events(state: State<'_, SharedManager>) -> Result<Vec<EventLogEntry>, String> {
     use std::time::Duration;
     const INTER_MSG_TIMEOUT: Duration = Duration::from_secs(5);
-    const HARD_CAP_ENTRIES: usize = 5000; // garde-fou stream runaway
+    const HARD_CAP_ENTRIES: usize = 5000; // runaway stream guard
 
-    // Installe le collecteur et envoie la commande (lock court).
     let rx = {
         let mut mgr = lock_mgr(state.inner())?;
         mgr.prepare_events_stream()?
@@ -986,8 +749,6 @@ pub fn get_events(state: State<'_, SharedManager>) -> Result<Vec<EventLogEntry>,
     let mut entries: Vec<EventLogEntry> = Vec::new();
     let mut got_begin = false;
 
-    // Helper local de cleanup. State est capturé par référence (pas de move
-    // dans une closure — évite les soucis de type inference sur SharedManager).
     fn cleanup_collector(state: &SharedManager) {
         if let Ok(mut mgr) = state.lock() {
             mgr.clear_events_collector();
@@ -1002,19 +763,15 @@ pub fn get_events(state: State<'_, SharedManager>) -> Result<Vec<EventLogEntry>,
                         got_begin = true;
                     }
                     Some("end") => {
-                        // Le dispatcher a déjà remis le collector à None.
+                        // The dispatcher already cleared the collector.
                         return Ok(entries);
                     }
-                    _ => {
-                        // Ack sans phase attendue — on ignore mais on continue.
-                    }
+                    _ => {}
                 }
             }
             Ok(Ok(DeviceMessage::Event { line, seq })) => {
                 if !got_begin {
-                    // Event avant begin : format firmware cassé. On tolère
-                    // mais on log pour diag.
-                    eprintln!("[get_events] event reçu avant ack begin");
+                    eprintln!("[get_events] event received before begin ack");
                 }
                 entries.push(EventLogEntry {
                     line,
@@ -1023,26 +780,24 @@ pub fn get_events(state: State<'_, SharedManager>) -> Result<Vec<EventLogEntry>,
                 if entries.len() >= HARD_CAP_ENTRIES {
                     cleanup_collector(state.inner());
                     return Err(format!(
-                        "Stream trop long ({} events) — firmware cassé ?",
+                        "Stream too long ({} events), firmware fault?",
                         HARD_CAP_ENTRIES
                     ));
                 }
             }
             Ok(Ok(DeviceMessage::Error { msg, .. })) => {
                 cleanup_collector(state.inner());
-                return Err(format!("Firmware rejette get_events: {}", msg));
+                return Err(format!("Device rejected get_events: {}", msg));
             }
-            Ok(Ok(_)) => {
-                // Autre message inattendu — on ignore silencieusement.
-            }
+            Ok(Ok(_)) => {}
             Ok(Err(e)) => {
                 cleanup_collector(state.inner());
-                return Err(format!("Stream interrompu: {}", e));
+                return Err(format!("Stream interrupted: {}", e));
             }
             Err(_) => {
                 cleanup_collector(state.inner());
                 return Err(format!(
-                    "Timeout stream events (aucun message reçu depuis {}s)",
+                    "Event stream timeout (nothing received for {}s)",
                     INTER_MSG_TIMEOUT.as_secs()
                 ));
             }

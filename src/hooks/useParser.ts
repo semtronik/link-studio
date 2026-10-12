@@ -11,7 +11,6 @@ export function useParser() {
   const [parserInfo, setParserInfo] = useState<ParserInfo | null>(null);
   const [parserError, setParserError] = useState<string | null>(null);
 
-  // Créer le worker au mount
   useEffect(() => {
     const worker = new Worker(
       new URL('../workers/parser.worker.ts', import.meta.url),
@@ -68,7 +67,6 @@ export function useParser() {
 
     workerRef.current = worker;
 
-    // Charger le parseur Raw par défaut
     worker.postMessage({ type: 'load', code: RAW_PARSER_CODE });
 
     return () => {
@@ -80,7 +78,7 @@ export function useParser() {
   const loadParser = useCallback((code: string): Promise<ParserInfo> => {
     return new Promise((resolve, reject) => {
       if (!workerRef.current) {
-        reject(new Error('Worker non initialisé'));
+        reject(new Error('Worker not initialized'));
         return;
       }
       loadPromiseRef.current = { resolve, reject };
@@ -95,7 +93,7 @@ export function useParser() {
   const decodeFrame = useCallback((id: string, hex: string, context: DecodeContext): Promise<DecodeResult> => {
     return new Promise((resolve, reject) => {
       if (!workerRef.current) {
-        reject(new Error('Worker non initialisé'));
+        reject(new Error('Worker not initialized'));
         return;
       }
       pendingRef.current.set(id, { resolve, reject });
@@ -106,7 +104,7 @@ export function useParser() {
   const analyzeFrames = useCallback((frames: Array<{ id: string; hex: string; timestamp: number; decoded: DecodeResult }>): Promise<AnalyzeResult> => {
     return new Promise((resolve, reject) => {
       if (!workerRef.current) {
-        reject(new Error('Worker non initialisé'));
+        reject(new Error('Worker not initialized'));
         return;
       }
       analyzePromiseRef.current = { resolve, reject };

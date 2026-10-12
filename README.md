@@ -1,11 +1,11 @@
-# LFT App
+# Link Studio
 
-Desktop companion app for the **LoRa Field Toolkit (LFT)** — a handheld
-diagnostic tool for LoRa P2P radio links.
+Desktop app for the **Semtronik Link** devices. First supported product:
+**Link-LR**, a LoRa traffic analyzer and generator.
 
 ## What this app does
 
-When connected to an LFT device over USB, the app displays:
+When connected to a Link-LR over USB, the app displays:
 
 - **Received frames** in real time (RSSI, SNR, payload in hex, timestamp)
 - **Link quality metrics** (packet timing, frame statistics)
@@ -13,8 +13,7 @@ When connected to an LFT device over USB, the app displays:
 - **Custom JavaScript parsers** — write your own decoder for application
   payloads, with live preview as frames arrive
 
-The LFT device receives LoRa P2P frames; this app is the window to read them
-from a laptop.
+For the LFT prototype, use [lft-app 1.0.1](https://github.com/semtronik/link-studio/releases/tag/v1.0.1).
 
 ## Tech stack
 
@@ -36,8 +35,8 @@ from a laptop.
 ### Build
 
 ```bash
-git clone https://github.com/semtronik/lft-app.git
-cd lft-app
+git clone https://github.com/semtronik/link-studio.git
+cd link-studio
 npm install
 npm run tauri build
 ```

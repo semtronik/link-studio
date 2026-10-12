@@ -110,7 +110,7 @@ function Spinner() {
 async function exportCsv(rows: ParsedEvent[]) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const path = await save({
-    defaultPath: `lft-events-${stamp}.csv`,
+    defaultPath: `link-events-${stamp}.csv`,
     filters: [{ name: 'CSV', extensions: ['csv'] }],
   });
   if (!path) return;
@@ -132,7 +132,7 @@ export function DiagnosticCard() {
       const parsed = raw.map(parseEvent).sort((a, b) => b.seq - a.seq);
       setEntries(parsed);
     } catch (e) {
-      const msg = typeof e === 'string' ? e : (e as Error).message ?? 'Erreur inconnue';
+      const msg = typeof e === 'string' ? e : (e as Error).message ?? 'Unknown error';
       setError(msg);
     } finally {
       setLoading(false);
@@ -154,26 +154,26 @@ export function DiagnosticCard() {
           disabled={!connected || loading}
           className="px-3 py-1.5 text-[12px] rounded-element bg-brand/15 text-brand border border-brand/30 hover:bg-brand/25 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
         >
-          {loading ? 'Chargement…' : 'Rafraîchir'}
+          {loading ? 'Loading…' : 'Refresh'}
         </button>
         <button
           onClick={() => entries && exportCsv(entries).catch(e => setError(e instanceof Error ? e.message : String(e)))}
           disabled={!entries || entries.length === 0}
           className="px-3 py-1.5 text-[12px] rounded-element bg-surface text-text-secondary border border-border hover:text-text hover:border-brand/50 hover:bg-overlay active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-border disabled:hover:bg-surface transition-all"
         >
-          Exporter CSV
+          Export CSV
         </button>
       </div>
 
       <div className="min-h-[400px] max-h-[400px] overflow-y-auto relative">
         {!connected ? (
           <div className="px-4 py-12 text-center text-text-muted text-sm">
-            Connectez un appareil pour voir les events
+            Connect a device to see its events
           </div>
         ) : loading && entries === null ? (
           <div className="px-4 py-12 flex flex-col items-center justify-center gap-3">
             <Spinner />
-            <span className="text-text-muted text-xs">Recuperation des events...</span>
+            <span className="text-text-muted text-xs">Fetching events…</span>
           </div>
         ) : error ? (
           <div className="px-4 py-12 text-center text-rssi-bad text-sm">
@@ -181,7 +181,7 @@ export function DiagnosticCard() {
           </div>
         ) : entries === null || entries.length === 0 ? (
           <div className="px-4 py-12 text-center text-text-muted text-sm">
-            Aucun event enregistre
+            No events recorded
           </div>
         ) : (
           <>

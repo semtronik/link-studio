@@ -37,7 +37,7 @@ export function useFirmwareUpdater() {
       setFlashStatus('checking');
       const version = await fetchDeviceVersion();
       if (version === null) {
-        setError("Ce device ne supporte pas la mise a jour OTA");
+        setError("This device does not support OTA updates");
         setFlashStatus('error');
         setIsFlashing(false);
         return;

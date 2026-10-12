@@ -1,8 +1,8 @@
-/** Code JS du parseur Raw, évalué dans le Web Worker */
+/** Raw parser source, evaluated in the Web Worker. */
 export const RAW_PARSER_CODE = `({
   name: "Raw",
   version: "1.0.0",
-  description: "Affiche les données brutes sans décodage",
+  description: "Shows raw data without decoding",
   decode(hex) {
     const byteCount = Math.floor(hex.length / 2);
     return {
@@ -12,7 +12,7 @@ export const RAW_PARSER_CODE = `({
         bytes: [0, byteCount],
         color: "gray"
       }],
-      summary: byteCount + " octet" + (byteCount > 1 ? "s" : "")
+      summary: byteCount + " byte" + (byteCount !== 1 ? "s" : "")
     };
   }
 })`;

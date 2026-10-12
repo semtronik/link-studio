@@ -35,7 +35,7 @@ console.log(`\n=== Release ${tag} ===\n`);
 console.log('[1/3] Pre-flight checks...');
 
 if (!existsSync('package.json') || !existsSync('src-tauri/Cargo.toml')) {
-  fail('Run this script from the lft-app project root.');
+  fail('Run this script from the link-studio project root.');
 }
 
 // 2. Bump versions
@@ -79,14 +79,14 @@ const bundleDir = 'src-tauri/target/release/bundle';
 console.log(`\n=== Build ${tag} complete ===\n`);
 console.log('Local artifacts:');
 if (os === 'win32') {
-  console.log(`  ${bundleDir}/nsis/lft-app_${version}_x64-setup.exe`);
-  console.log(`  ${bundleDir}/msi/lft-app_${version}_x64_en-US.msi`);
+  console.log(`  ${bundleDir}/nsis/Link Studio_${version}_x64-setup.exe`);
+  console.log(`  ${bundleDir}/msi/Link Studio_${version}_x64_en-US.msi`);
 } else if (os === 'darwin') {
-  console.log(`  ${bundleDir}/dmg/lft-app_${version}_aarch64.dmg`);
-  console.log(`  ${bundleDir}/macos/lft-app.app`);
+  console.log(`  ${bundleDir}/dmg/Link Studio_${version}_aarch64.dmg`);
+  console.log(`  ${bundleDir}/macos/Link Studio.app`);
 } else {
-  console.log(`  ${bundleDir}/deb/lft-app_${version}_amd64.deb`);
-  console.log(`  ${bundleDir}/appimage/lft-app_${version}_amd64.AppImage`);
+  console.log(`  ${bundleDir}/deb/Link Studio_${version}_amd64.deb`);
+  console.log(`  ${bundleDir}/appimage/Link Studio_${version}_amd64.AppImage`);
 }
 console.log('\nNext steps (manual):');
 console.log(`  git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json`);
@@ -95,5 +95,5 @@ console.log(`  git tag ${tag}`);
 console.log(`  git push origin main`);
 console.log(`  git push origin ${tag}`);
 console.log(`\n  Then create the GitHub Release and upload artifacts:`);
-console.log(`  https://github.com/semtronik/lft-app/releases/new?tag=${tag}`);
+console.log(`  https://github.com/semtronik/link-studio/releases/new?tag=${tag}`);
 console.log('');

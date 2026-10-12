@@ -1,24 +1,24 @@
 import { FirmwareFlasher } from './FirmwareFlasher';
 import { DiagnosticCard } from './DiagnosticCard';
 
-interface LFTViewProps {
+interface DeviceViewProps {
   onClose: () => void;
 }
 
-export function LFTView({ onClose }: LFTViewProps) {
+export function DeviceView({ onClose }: DeviceViewProps) {
   return (
     <div className="flex flex-col h-full w-full bg-base">
       <div className="flex items-center gap-3 px-4 py-3 border-b border-border/50">
         <button
           onClick={onClose}
-          title="Retour"
+          title="Back"
           className="w-8 h-8 flex items-center justify-center rounded-element text-text-secondary hover:text-text hover:bg-surface transition-colors"
         >
           <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
             <path fillRule="evenodd" d="M9.707 14.707a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 1.414L7.414 9H15a1 1 0 110 2H7.414l2.293 2.293a1 1 0 010 1.414z" clipRule="evenodd" />
           </svg>
         </button>
-        <h1 className="text-sm font-semibold text-text">LFT</h1>
+        <h1 className="text-sm font-semibold text-text">Device</h1>
       </div>
 
       <div className="flex-1 overflow-auto p-4">

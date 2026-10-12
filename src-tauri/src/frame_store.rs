@@ -2,7 +2,7 @@ use crate::lora_protocol::{FrameData, FrameStats};
 use std::collections::VecDeque;
 
 const MAX_FRAMES: usize = 500;
-// F4: recalibrer frequemment pour limiter la derive floating-point
+// Recompute sums periodically to bound floating-point drift.
 const RECALIBRATE_INTERVAL: usize = 50;
 
 pub struct FrameStore {

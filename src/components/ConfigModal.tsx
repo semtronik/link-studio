@@ -67,10 +67,10 @@ export function ConfigModal({ open, onClose, config, applyConfig }: ConfigModalP
     setSending(true);
     try {
       await applyConfig({ freq, sf, bw });
-      addToast('success', 'Configuration appliquée');
+      addToast('success', 'Configuration applied');
       handleClose();
     } catch (err) {
-      addToast('error', 'Erreur configuration', String(err));
+      addToast('error', 'Configuration failed', String(err));
     } finally {
       setSending(false);
     }
@@ -99,7 +99,7 @@ export function ConfigModal({ open, onClose, config, applyConfig }: ConfigModalP
       >
         {/* Header */}
         <div className="flex items-center justify-between mb-6">
-          <h2 className="text-base font-semibold text-text-primary">Configurer la radio</h2>
+          <h2 className="text-base font-semibold text-text-primary">Configure radio</h2>
           <button
             onClick={handleClose}
             disabled={sending}
@@ -111,9 +111,8 @@ export function ConfigModal({ open, onClose, config, applyConfig }: ConfigModalP
 
         {/* Form */}
         <div className="space-y-4">
-          {/* Fréquence */}
           <div className="flex justify-between items-center">
-            <label className="text-[13px] text-text-secondary">Fréquence</label>
+            <label className="text-[13px] text-text-secondary">Frequency</label>
             <input
               type="text"
               inputMode="decimal"
@@ -170,7 +169,7 @@ export function ConfigModal({ open, onClose, config, applyConfig }: ConfigModalP
             disabled={sending}
             className="px-4 py-2 text-sm text-text-secondary bg-transparent border border-border rounded-element hover:bg-overlay transition-all duration-200 disabled:opacity-50"
           >
-            Annuler
+            Cancel
           </button>
           <button
             onClick={handleApply}
@@ -183,9 +182,9 @@ export function ConfigModal({ open, onClose, config, applyConfig }: ConfigModalP
                   <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" className="opacity-25" />
                   <path d="M4 12a8 8 0 018-8" stroke="currentColor" strokeWidth="3" strokeLinecap="round" className="opacity-75" />
                 </svg>
-                Envoi...
+                Sending...
               </span>
-            ) : 'Appliquer'}
+            ) : 'Apply'}
           </button>
         </div>
       </div>

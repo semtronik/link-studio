@@ -42,7 +42,6 @@ pub fn run() {
             commands::serial_disconnect,
             commands::send_command,
             commands::apply_config,
-            commands::auto_setup,
             commands::get_config,
             commands::get_frames,
             commands::get_stats,
@@ -55,5 +54,5 @@ pub fn run() {
             commands::get_events,
         ])
         .run(tauri::generate_context!())
-        .expect("Erreur lors du démarrage de l'application");
+        .expect("Failed to start the application");
 }

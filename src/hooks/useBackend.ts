@@ -1,7 +1,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { useCallback, useRef, useState } from 'react';
 
-// Types miroir du Rust (les champs matchent le JSON serialise par serde rename_all camelCase)
+// Mirrors the Rust types (serde rename_all = camelCase).
 export interface LoRaConfig {
   freq: number; sf: number; bw: number; drops: number;
 }
@@ -12,7 +12,7 @@ export interface FrameStats {
   count: number; avgRssi: number | null; avgSnr: number | null;
 }
 export interface PortFirmwareInfo {
-  profile: FirmwareProfile;
+  kind: DeviceKind;
   product: string | null;
   model: string | null;
   version: string | null;
@@ -22,28 +22,18 @@ export interface PortFirmwareInfo {
 export interface PortInfo {
   path: string; manufacturer: string; product: string;
   vid: string; pid: string; serialNumber: string; portType: string;
-  // Enrichissement via le scanner Rust après identification firmware.
-  // Présent uniquement pour les ports identifiés comme LFT (V1 ou legacy).
+  // Set once the scanner's probe answered get_version.
   firmware?: PortFirmwareInfo | null;
-  // True tant que le scanner est en train d'identifier ce port (candidat
-  // VID Espressif, encore en phase Retrying). L'UI affiche un spinner à
-  // la place du label générique VID/PID le temps que le probe aboutisse.
   identifying?: boolean;
-  // True si le port est monopolisé par une autre application (Arduino IDE,
-  // moniteur série, PuTTY...). L'UI bloque la sélection et affiche un
-  // label dédié — un connect échouerait de toute façon tant que l'autre
-  // appli tient le handle.
+  // Held by another application: selection is blocked.
   busy?: boolean;
 }
 
-// Profil firmware identifié au connect via la commande get_version.
-// lftV1 : firmware LFT V1+ (product="LFT", model="v1"). Supporte sync heure,
-// timestamps UTC des trames, enregistrement futur.
-// legacy : firmware DevKit V0. Pas de réglage heure, timestamps PC à l'arrivée.
-export type FirmwareProfile = 'lftV1' | 'legacy';
+// From get_version. Only linkLr connects; lft is the prototype.
+export type DeviceKind = 'linkLr' | 'lft' | 'unknown';
 
 export interface FirmwareInfo {
-  profile: FirmwareProfile;
+  kind: DeviceKind;
   product: string | null;
   model: string | null;
   version: string | null;
@@ -51,7 +41,6 @@ export interface FirmwareInfo {
   mac: string | null;
 }
 
-// Résultat retourné par la commande Tauri sync_time (pour debug/toast éventuel).
 export interface TimeSyncResult {
   wasInSync: boolean;
   driftS: number;
@@ -59,9 +48,7 @@ export interface TimeSyncResult {
   didSync: boolean;
 }
 
-// Entrée de journal système (get_events). Le `line` est la ligne brute
-// écrite par le firmware (ex: "2026-04-15T14:32:09Z CHARGE_START pct=34").
-// Le parsing timestamp/event/details est fait côté UI dans DiagnosticCard.
+// Raw firmware line, e.g. "2026-04-15T14:32:09Z CHARGE_START pct=34"; parsed in DiagnosticCard.
 export interface EventLogEntry {
   line: string;
   seq: number;
@@ -86,7 +73,7 @@ export function useBackend() {
   const [loading, setLoading] = useState(false);
   const frameCallbackRef = useRef<((frame: FrameData) => void) | null>(null);
   const onDisconnectedRef = useRef<(() => void) | null>(null);
-  // F5: persister le Channel dans un ref pour eviter le GC JS
+  // Held in a ref so the Channel is not garbage-collected.
   const channelRef = useRef<Channel<SerialEvent> | null>(null);
 
   const createChannel = useCallback((): Channel<SerialEvent> => {
@@ -104,23 +91,21 @@ export function useBackend() {
           break;
         case 'firmware':
           setFirmware(event.data);
-          // Sync heure automatique sur LFT V1 uniquement (pas de dialogue,
-          // silencieuse : choix Q1 utilisateur). Fire-and-forget pour ne pas
-          // bloquer l'UI, tout échec est loggé mais non remonté.
-          if (event.data.profile === 'lftV1') {
+          {
+            // Silent and fire-and-forget: a failure is logged, never shown.
             const utc = Math.floor(Date.now() / 1000);
             const offsetMin = -new Date().getTimezoneOffset();
             invoke<TimeSyncResult>('sync_time', { utc, offsetMin })
               .then((r) => {
                 if (r.didSync) {
                   console.info(
-                    `[TIME] sync appliquée (drift=${r.driftS.toFixed(1)}s, wasInvalid=${r.wasInvalid})`,
+                    `[TIME] clock set (drift=${r.driftS.toFixed(1)}s, wasInvalid=${r.wasInvalid})`,
                   );
                 } else {
-                  console.info(`[TIME] déjà à l'heure (drift=${r.driftS.toFixed(1)}s)`);
+                  console.info(`[TIME] already on time (drift=${r.driftS.toFixed(1)}s)`);
                 }
               })
-              .catch((e) => console.warn('[TIME] sync échouée:', e));
+              .catch((e) => console.warn('[TIME] sync failed:', e));
           }
           break;
         case 'disconnected':
@@ -132,7 +117,6 @@ export function useBackend() {
           break;
       }
     };
-    // F5: stocker dans le ref pour empecher le GC
     channelRef.current = channel;
     return channel;
   }, []);
@@ -160,7 +144,7 @@ export function useBackend() {
     try {
       await invoke('serial_disconnect');
     } catch (e) {
-      // F6: log mais ne pas bloquer — le disconnect peut echouer si deja deconnecte
+      // Fails harmlessly if already disconnected.
       console.warn('[useBackend] disconnect error:', e);
     }
     channelRef.current = null;
@@ -181,21 +165,6 @@ export function useBackend() {
   const sendCommand = useCallback(async (cmd: string, value?: number) => {
     return invoke('send_command', { cmd, value });
   }, []);
-
-  const autoSetup = useCallback(async (): Promise<LoRaConfig> => {
-    setLoading(true);
-    try {
-      const channel = createChannel();
-      const result = await invoke<{ config: LoRaConfig; port: string }>('auto_setup', { onEvent: channel });
-      setConnected(true);
-      setDataSource('live');
-      setCurrentPort(result.port);
-      setConfig(result.config);
-      return result.config;
-    } finally {
-      setLoading(false);
-    }
-  }, [createChannel]);
 
   const getValidParams = useCallback(async () => {
     return invoke<{ bandwidths: number[]; spreadingFactors: number[] }>('get_valid_params');
@@ -255,7 +224,7 @@ export function useBackend() {
     dataSource, currentPort, firmware, loading,
     connect, disconnect,
     applyConfig, sendCommand,
-    autoSetup, getValidParams,
+    getValidParams,
     clearFrames, loadCapture,
     getFrames, getStats,
     getEvents,

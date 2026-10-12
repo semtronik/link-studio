@@ -9,9 +9,7 @@
   --color-brand-100: rgba(71, 171, 255, 0.12);
   --color-brand-200: #B3D9FF;
 
-  /* Semantic — RSSI/SNR (thématisés via --t-rssi-*).
-   * Light mode utilise des teintes plus sombres pour rester lisibles
-   * sur fond blanc ; dark mode garde les teintes vives originales. */
+  /* Semantic — RSSI/SNR, themed through --t-rssi-*. */
   --color-rssi-good: var(--t-rssi-good);
   --color-rssi-medium: var(--t-rssi-medium);
   --color-rssi-bad: var(--t-rssi-bad);
@@ -54,8 +52,7 @@
   --t-shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.06);
   --t-shadow-medium: 0 4px 8px rgba(0, 0, 0, 0.08);
   --t-shadow-elevated: 0 8px 24px rgba(0, 0, 0, 0.12);
-  /* Sémantique RSSI : teintes sombres pour rester lisibles sur fond clair.
-   * green-600 / amber-600 / red-600 (Tailwind). */
+  /* RSSI: darker shades to stay readable on white (Tailwind 600). */
   --t-rssi-good: #16A34A;
   --t-rssi-medium: #D97706;
   --t-rssi-bad: #DC2626;
@@ -75,8 +72,7 @@
   --t-shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.3);
   --t-shadow-medium: 0 4px 8px rgba(0, 0, 0, 0.4);
   --t-shadow-elevated: 0 8px 24px rgba(0, 0, 0, 0.5);
-  /* Sémantique RSSI : teintes vives pour fond sombre.
-   * green-400 / amber-400 / red-400 (Tailwind). */
+  /* RSSI: bright shades for the dark background (Tailwind 400). */
   --t-rssi-good: #4ADE80;
   --t-rssi-medium: #FBBF24;
   --t-rssi-bad: #F87171;
@@ -128,9 +124,7 @@ input, select {
   to { opacity: 0; transform: translateX(24px); }
 }
 
-/* DetailPanel — le panneau est monte en permanence sous la liste.
-   L'animation ne joue plus a l'ouverture/fermeture mais a chaque
-   changement de trame selectionnee. */
+/* DetailPanel stays mounted: the animation plays on each new selection. */
 @keyframes detail-slide-in {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: translateY(0); }

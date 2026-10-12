@@ -4,12 +4,9 @@ import { computeToaMs } from '../utils/loraToa';
 import type { DecodedFrame, Field, Annotation } from '../types/parser';
 
 interface DetailPanelProps {
-  /* null = aucune trame selectionnee. Le panneau reste monte et affiche
-   * un etat vide : sa largeur est reservee en permanence pour que le
-   * tableau ne soit pas redimensionne a chaque selection. */
+  /* null still renders the panel, so the table never resizes on selection. */
   frame: DecodedFrame | null;
   annotation?: Annotation;
-  /* Config radio courante, pour le Time on Air theorique. */
   sf?: number;
   bw?: number;
 }
@@ -63,16 +60,8 @@ function ParsedFieldsGrid({ fields, highlightedField, onHighlightField }: {
   );
 }
 
-/* Empile sous la liste : hauteur fixe, pleine largeur. Cote a cote
- * (conteneur >= 1140px, soit la largeur qu'il faut pour afficher toutes
- * les colonnes du tableau ET le panneau) : hauteur alignee sur la liste,
- * largeur a 40% du conteneur, bornee entre 420 et 640px. Le plafond est
- * volontaire : au-dela de ~24 octets par ligne, un dump hexa devient plus
- * difficile a parcourir, pas plus lisible. Le plancher garantit une ligne
- * exploitable (~16 octets).
- * Dans les deux cas la zone est reservee en permanence, y compris sans
- * selection — la liste ne se redimensionne jamais au clic.
- * Le seuil doit rester identique a celui de FrameViewer. */
+/* The 1140px breakpoint must match FrameViewer. Max width is deliberate:
+ * beyond ~24 bytes per line a hex dump gets harder to scan. */
 const PANEL_CLASSES =
   'h-[260px] @[1140px]:h-auto @[1140px]:w-[40%] @[1140px]:min-w-[420px] @[1140px]:max-w-[640px] flex-shrink-0 overflow-y-auto bg-surface rounded-card border border-[rgba(255,255,255,0.04)] shadow-subtle p-4';
 
@@ -83,7 +72,7 @@ export function DetailPanel({ frame, annotation, sf, bw }: DetailPanelProps) {
     return (
       <div className={`${PANEL_CLASSES} flex items-center justify-center`}>
         <p className="text-[12px] text-text-muted text-center">
-          Selectionnez une trame<br />pour voir son detail
+          Select a frame<br />to see its details
         </p>
       </div>
     );
@@ -91,10 +80,7 @@ export function DetailPanel({ frame, annotation, sf, bw }: DetailPanelProps) {
 
   const fields = frame.decoded?.fields || [];
 
-  /* Un champ qui couvre tout le payload et se contente d'en repeter les
-   * octets n'ajoute rien au bloc hexa colorise juste au-dessus — c'est le
-   * cas du champ unique "Data" du parseur Raw. On l'ecarte de la liste
-   * pour ne pas afficher deux fois le meme dump. */
+  /* Hide a field that merely repeats the whole payload (the Raw parser's "Data"). */
   const byteCount = frame.hex.length / 2;
   const listedFields = fields.filter(field => {
     const [start, end] = field.bytes;
@@ -111,7 +97,7 @@ export function DetailPanel({ frame, annotation, sf, bw }: DetailPanelProps) {
     >
       <div className="flex items-center gap-3 mb-2">
         <h3 className="text-[13px] font-medium text-text-secondary uppercase tracking-wider">
-          Detail trame — {formatTimestamp(frame.timestamp)}
+          Frame detail — {formatTimestamp(frame.timestamp)}
         </h3>
         {annotation && (
           <span className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-medium border ${ANNOTATION_BADGE[annotation.status]}`}>
@@ -121,11 +107,11 @@ export function DetailPanel({ frame, annotation, sf, bw }: DetailPanelProps) {
       </div>
 
       <div className="flex flex-wrap gap-x-4 gap-y-1 mb-3 font-mono text-[12px] text-text-muted">
-        <span>{byteCount} o</span>
+        <span>{byteCount} B</span>
         {frame.rssi != null && <span>{frame.rssi} dBm</span>}
         {frame.snr != null && <span>{frame.snr} dB</span>}
         {sf && bw && (
-          <span title="Time on Air theorique (config LFT : CR 4/8, preambule 15)">
+          <span title="Theoretical time on air (assumes CR 4/8, preamble 15)">
             ToA {formatToa(computeToaMs(byteCount, sf, bw))}
           </span>
         )}
@@ -133,13 +119,10 @@ export function DetailPanel({ frame, annotation, sf, bw }: DetailPanelProps) {
 
       {frame.decodeError && (
         <div className="text-rssi-bad text-xs mb-3">
-          Erreur : {frame.decodeError}
+          Error: {frame.decodeError}
         </div>
       )}
 
-      {/* Empile sous la liste, le panneau est large mais bas : hex et champs
-        * cote a cote. En colonne de droite il est etroit et haut : ils
-        * s'empilent. Le seuil est celui de la disposition generale. */}
       <div className="flex gap-6 @[1140px]:flex-col @[1140px]:gap-4">
         <div className="flex-1 min-w-0 @[1140px]:flex-none">
           <HexColorized
@@ -152,8 +135,6 @@ export function DetailPanel({ frame, annotation, sf, bw }: DetailPanelProps) {
         </div>
 
         {listedFields.length > 0 && (
-          /* Le filet ne separe qu'en mode empile : cote a cote, l'ecart
-            * horizontal suffit. */
           <div className="flex-1 min-w-0 @[1140px]:flex-none @[1140px]:pt-4 @[1140px]:border-t @[1140px]:border-[rgba(255,255,255,0.06)]">
             <ParsedFieldsGrid
               fields={listedFields}

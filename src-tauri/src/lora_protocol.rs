@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-// --- Types envoyes au device ---
+// --- Sent to the device ---
 #[derive(Debug, Clone, Serialize)]
 pub struct SerialCommand {
     pub cmd: String,
@@ -8,7 +8,7 @@ pub struct SerialCommand {
     pub value: Option<f64>,
 }
 
-// --- Types recus du device ---
+// --- Received from the device ---
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum DeviceMessage {
@@ -53,24 +53,21 @@ pub enum DeviceMessage {
         product: Option<String>,
         #[serde(default)]
         model: Option<String>,
-        /// MAC efuse factory du LFT, format "AA:BB:CC:DD:EE:FF". Identifiant
-        /// hardware unique. Présent à partir du firmware qui expose ce champ.
+        /// Factory efuse MAC, "AA:BB:CC:DD:EE:FF". Absent on older firmware.
         #[serde(default)]
         mac: Option<String>,
         #[serde(default)]
         partition: Option<String>,
         #[serde(default)]
         written: Option<f64>,
-        /// Phase d'un stream multi-messages (get_events : "begin" / "end").
-        /// None pour les ack mono-message classiques.
+        /// Multi-message stream phase (get_events: "begin" / "end").
         #[serde(default)]
         phase: Option<String>,
-        /// Nombre d'events streamés (présent sur ack phase=end de get_events).
+        /// Streamed event count, on the get_events phase=end ack.
         #[serde(default)]
         count: Option<u32>,
     },
-    /// Ligne de journal système streamée en réponse à get_events.
-    /// Envoyée entre les ack phase=begin et phase=end.
+    /// get_events log line, sent between the phase=begin and phase=end acks.
     #[serde(rename = "event")]
     Event {
         line: String,
@@ -92,7 +89,7 @@ pub enum DeviceMessage {
     },
 }
 
-// --- Types exposes au frontend ---
+// --- Exposed to the frontend ---
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoRaConfig {
@@ -103,7 +100,7 @@ pub struct LoRaConfig {
 }
 
 impl LoRaConfig {
-    /// Arrondit freq à 1 décimale pour compenser l'imprécision float32 firmware.
+    /// Rounds freq to absorb the firmware's float32 error.
     pub fn sanitized(mut self) -> Self {
         self.freq = (self.freq * 1000.0).round() / 1000.0;
         self
@@ -140,22 +137,13 @@ pub struct PortInfo {
     pub pid: String,
     pub serial_number: String,
     pub port_type: String,
-    /// Identification firmware si le port a été probé avec succès. Permet
-    /// à l'UI d'afficher "LFT V1 (v0.2.3)" plutôt que "USB JTAG/serial debug
-    /// unit". None tant que le probe n'a pas eu lieu ou a échoué.
+    /// None until a probe has identified the device.
     #[serde(default)]
     pub firmware: Option<PortFirmwareInfo>,
-    /// True tant que le scanner considère ce port candidat à un LFT mais
-    /// n'a pas encore tranché. L'UI affiche alors un spinner plutôt que le
-    /// label générique VID/PID — évite de faire croire que le port est une
-    /// boîte vide alors qu'on est en train de l'identifier.
+    /// Probe still in progress.
     #[serde(default)]
     pub identifying: bool,
-    /// True si le port est monopolisé par une autre application (Arduino IDE,
-    /// PuTTY, moniteur série…). Détecté par un échec d'ouverture immédiat
-    /// lors du probe. L'UI affiche "Utilisé par une autre application" et
-    /// bloque la sélection, pour éviter un connect qui échouerait de toute
-    /// façon avec PortBusy.
+    /// Held by another application; connecting would fail with PortBusy.
     #[serde(default)]
     pub busy: bool,
 }
@@ -163,35 +151,29 @@ pub struct PortInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortFirmwareInfo {
-    pub profile: FirmwareProfile,
+    pub kind: DeviceKind,
     pub product: Option<String>,
     pub model: Option<String>,
     pub version: Option<String>,
     pub mac: Option<String>,
 }
 
-// --- Commandes valides ---
-// Commandes exposées au frontend via `invoke('send_command', ...)`. Les
-// commandes temps (set_time/get_time) ne sont PAS ici car elles transitent
-// par `sync_time` (payload JSON custom avec offset_min, non supporté par
-// SerialCommand{cmd,value}).
+// Commands the frontend may send via `send_command`. Time commands go through
+// `sync_time` instead: their payload carries offset_min, which SerialCommand can't.
 pub const VALID_COMMANDS: &[&str] = &[
     "get_config", "set_freq", "set_sf", "set_bw",
     "get_version", "ota_begin", "ota_data", "ota_end", "reboot",
 ];
 
-// Commandes utilisables en interne par send_command_safe (inclut get_time
-// qui est appelé par la commande Tauri sync_time).
+// Commands allowed internally by send_command_safe.
 pub const INTERNAL_COMMANDS: &[&str] = &[
     "get_config", "set_freq", "set_sf", "set_bw", "get_time",
     "get_version", "ota_begin", "ota_data", "ota_end", "reboot",
     "get_events",
 ];
 
-/// Entrée de journal système remontée au frontend par la commande Tauri
-/// `get_events`. `line` est le texte brut stocké par le firmware (ex :
-/// "2026-04-15T14:32:09Z CHARGE_START pct=34"). Le parsing timestamp /
-/// event / details est fait côté front pour laisser la flexibilité d'UI.
+/// Raw device log line, e.g. "2026-04-15T14:32:09Z CHARGE_START pct=34";
+/// parsed by the frontend.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventLogEntry {
@@ -199,33 +181,21 @@ pub struct EventLogEntry {
     pub seq: u32,
 }
 
-// --- Resultat auto_setup ---
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AutoSetupResult {
-    pub config: LoRaConfig,
-    pub port: String,
-}
-
-// --- Profil firmware ---
-// LftV1 : firmware LFT V1+ (expose product="LFT", model="v1"). Supporte sync
-// heure, timestamps UTC des trames, enregistrement futur.
-// Legacy : firmware DevKit V0 (pas de product/model). Pas de réglage heure,
-// timestamps PC au lieu du device.
+/// What answered `get_version`. Only `LinkLr` is supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum FirmwareProfile {
-    LftV1,
-    Legacy,
+pub enum DeviceKind {
+    LinkLr,
+    Lft,
+    Unknown,
 }
 
-impl FirmwareProfile {
-    /// Détermine le profil à partir de la réponse `get_version`. Le LFT V1
-    /// renvoie `product:"LFT"` et `model:"v1"`. Tout le reste = legacy.
+impl DeviceKind {
     pub fn from_version_ack(product: Option<&str>, model: Option<&str>) -> Self {
         match (product, model) {
-            (Some("LFT"), Some("v1")) => FirmwareProfile::LftV1,
-            _ => FirmwareProfile::Legacy,
+            (Some("Link"), Some("Link-LR")) => DeviceKind::LinkLr,
+            (Some("LFT"), _) => DeviceKind::Lft,
+            _ => DeviceKind::Unknown,
         }
     }
 }
@@ -233,7 +203,7 @@ impl FirmwareProfile {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FirmwareInfo {
-    pub profile: FirmwareProfile,
+    pub kind: DeviceKind,
     pub product: Option<String>,
     pub model: Option<String>,
     pub version: Option<String>,
@@ -241,7 +211,7 @@ pub struct FirmwareInfo {
     pub mac: Option<String>,
 }
 
-// --- Events streames via Channel ---
+// --- Events streamed via Channel ---
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
 pub enum SerialEvent {
@@ -257,8 +227,6 @@ pub enum SerialEvent {
     Disconnected,
 }
 
-// --- Constantes LoRa ---
-// Exposees au frontend via get_valid_params() pour peupler les selects/dropdowns.
-// La validation reelle est faite par le firmware ESP-IDF (device-side backstop).
+// LoRa options for the frontend selects; the firmware does the real validation.
 pub const VALID_BANDWIDTHS: &[f64] = &[125.0, 250.0, 500.0];
 pub const SPREADING_FACTORS: &[u8] = &[7, 8, 9, 10, 11, 12];

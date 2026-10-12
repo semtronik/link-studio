@@ -48,7 +48,7 @@ export function FrameProvider({ children }: { children: ReactNode }) {
 export function useFrameContext(): FrameContextType {
   const ctx = useContext(FrameContext);
   if (!ctx) {
-    throw new Error('useFrameContext doit etre utilise dans un FrameProvider');
+    throw new Error('useFrameContext must be used within a FrameProvider');
   }
   return ctx;
 }

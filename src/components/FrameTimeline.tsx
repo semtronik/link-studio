@@ -6,41 +6,28 @@ interface FrameTimelineProps {
   frames: DecodedFrame[];
   selectedFrameId: string | null;
   onSelectFrame: (frame: DecodedFrame) => void;
-  /* Config radio courante, pour le calcul du Time on Air. Absente tant
-   * qu'aucun appareil n'est connecte : les trames sont alors dessinees a
-   * largeur minimale. */
+  /* Unset until a device is connected: frames are then drawn at minimum width. */
   sf?: number;
   bw?: number;
 }
 
-/* Largeur minimale d'une trame en pixels. Dezoome, un ToA de quelques
- * dizaines de ms tombe sous le pixel et la trame disparaitrait. */
+/* Zoomed out, a ToA of a few tens of ms falls below one pixel. */
 const MIN_FRAME_PX = 2;
 
-/* Tolerance de saisie d'un curseur, en pixels de part et d'autre. */
 const CURSOR_GRAB_PX = 7;
 
-/* Distance en pixels sous laquelle un curseur en cours de deplacement
- * s'aimante au bord de trame (debut ou fin) le plus proche. */
+/* A dragged cursor snaps to the nearest frame edge within this distance. */
 const SNAP_PX = 8;
 
-/* Bornes de la hauteur des barres, en fraction de la zone de dessin. La
- * hauteur code la taille du payload : une trame de 6 octets et une de
- * 199 doivent se distinguer sans lire la table. */
+/* Bar height encodes payload size. */
 const BAR_MIN_RATIO = 0.15;
 const BAR_MAX_RATIO = 1;
 const BAR_FULL_SCALE_BYTES = 255;
 
-/* Hauteur de la zone de dessin. Reglable par l'utilisateur : il n'existe
- * pas de bonne valeur en soi, l'arbitrage table / timeline depend de ce
- * qu'on est en train de faire (balayer une capture ou comparer des
- * payloads) et change en cours de session. */
-const TIMELINE_HEIGHT_KEY = 'lft.timeline.height';
+const TIMELINE_HEIGHT_KEY = 'link-studio.timeline.height';
 const HEIGHT_MIN = 100;
 const HEIGHT_DEFAULT = 140;
-/* Hauteur minimale laissee a la table au-dessus. Doit rester coherente
- * avec le `min-h` de FrameTable : en deca, sa zone se replierait sur
- * elle-meme et son cadre se confondrait avec celui de la timeline. */
+/* Must match FrameTable's `min-h`, or the table collapses. */
 const TABLE_MIN_HEIGHT = 120;
 
 function loadStoredHeight(): number {
@@ -49,22 +36,9 @@ function loadStoredHeight(): number {
   return Number.isFinite(parsed) ? Math.max(HEIGHT_MIN, parsed) : HEIGHT_DEFAULT;
 }
 
-/* ============================================================
- * Timeline des trames — echelle temporelle reelle
- *
- * Chaque trame est un tick vertical positionne selon son horodatage, et
- * NON selon son rang : c'est ce qui rend visibles les rafales (ticks
- * tasses) et les silences (vides), l'information qu'on cherche quand on
- * analyse des delais. Une echelle par rang afficherait des ecarts
- * reguliers et perdrait exactement ce qu'on veut voir.
- *
- * Consequence : sur une capture longue avec une rafale courte, la rafale
- * est un trait unique a l'echelle globale — d'ou le zoom (molette) et le
- * pan (glisser), indispensables et non optionnels ici.
- * ============================================================ */
+/* Frames are placed by timestamp, not by rank, so bursts and gaps stay visible. */
 
-/* Seuils RSSI alignes sur StatusIndicator — la lecture des couleurs doit
- * etre identique dans toute l'app. */
+/* Same thresholds as StatusIndicator. */
 const RSSI_GOOD = -80;
 const RSSI_MEDIUM = -100;
 
@@ -86,9 +60,6 @@ const TICK_HIT_RADIUS = 6;
 const MIN_SPAN_MS = 20;
 const PADDING_RATIO = 0.02;
 
-/* Graduation "ronde" immediatement superieure a l'ecart brut, pour que
- * les libelles tombent sur des valeurs lisibles (100ms, 500ms, 1s, 5s...)
- * plutot que sur des multiples arbitraires. */
 const NICE_STEPS_MS = [
   10, 20, 50, 100, 200, 500,
   1_000, 2_000, 5_000, 10_000, 15_000, 30_000,
@@ -104,7 +75,7 @@ function formatAxisLabel(ms: number, stepMs: number): string {
   const d = new Date(ms);
   const pad = (n: number, len = 2) => String(n).padStart(len, '0');
   const hms = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  /* Sous la seconde, l'heure seule ne distingue plus deux graduations. */
+  /* Below one second, hh:mm:ss alone no longer tells ticks apart. */
   return stepMs < 1000 ? `${hms}.${pad(d.getMilliseconds(), 3)}` : hms;
 }
 
@@ -120,17 +91,10 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
   const wrapRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
 
-  /* Fenetre temporelle affichee. null = suivi automatique : la vue couvre
-   * toute la capture et s'etend avec les nouvelles trames. Des que
-   * l'utilisateur zoome ou fait un pan, elle devient explicite et on cesse
-   * de la bouger sous ses yeux — meme logique que l'auto-scroll du
-   * tableau. */
+  /* null = auto-follow the whole capture; set once the user zooms or pans. */
   const [view, setView] = useState<{ start: number; end: number } | null>(null);
   const dragRef = useRef<{ x: number; start: number; end: number; moved: boolean } | null>(null);
 
-  /* Curseurs de mesure A et B, en instants libres (ms epoch). Toujours
-   * visibles, deplacables a la souris. null tant qu'aucune trame n'a
-   * permis de les positionner. */
   const [cursors, setCursors] = useState<{ a: number; b: number } | null>(null);
   const cursorDragRef = useRef<'a' | 'b' | null>(null);
   const [overCursor, setOverCursor] = useState(false);
@@ -145,9 +109,7 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
   }, [height]);
 
 
-  /* La hauteur memorisee peut depasser la place disponible (fenetre plus
-   * petite qu'a la session precedente) : on la ramene dans les bornes des
-   * que la colonne est mesurable, et a chaque redimensionnement fenetre. */
+  /* The stored height may exceed the space left in a smaller window. */
   useEffect(() => {
     const clamp = () => {
       const column = rootRef.current?.parentElement;
@@ -160,15 +122,10 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
     return () => window.removeEventListener('resize', clamp);
   }, []);
 
-  /* Redimensionnement : la poignee est en haut, tirer vers le haut
-   * agrandit la timeline (et reduit la table d'autant). Ecouteurs poses
-   * sur window pour que le geste survive a une sortie du curseur. */
   const startResize = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
-      /* Plafond calcule sur la colonne qui contient table + timeline, et
-       * non sur la fenetre entiere : c'est cette hauteur-la qui est
-       * partagee entre les deux, et elle exclut l'en-tete et les marges. */
+      /* Cap on the column shared by table + timeline, not the whole window. */
       const column = rootRef.current?.parentElement;
       const available = column?.clientHeight ?? window.innerHeight;
       maxHeightRef.current = Math.max(HEIGHT_MIN, available - TABLE_MIN_HEIGHT);
@@ -181,8 +138,6 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
     const onMove = (e: MouseEvent) => {
       const r = resizeRef.current;
       if (!r) return;
-      /* Curseur maintenu et selection de texte neutralisee pendant tout le
-       * geste, y compris quand la souris sort de la poignee. */
       document.body.style.cursor = 'row-resize';
       document.body.style.userSelect = 'none';
       const max = maxHeightRef.current;
@@ -202,18 +157,12 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
     };
   }, []);
 
-  /* Points tries par temps, en millisecondes. `frames` arrive deja en
-   * ordre d'arrivee, mais la timeline ne doit pas dependre de cette
-   * garantie pour positionner ses ticks. */
   const points = useMemo(() => {
     return frames
       .map(frame => {
         const bytes = frame.hex.length / 2;
         const toaMs = sf && bw ? computeToaMs(bytes, sf, bw) : 0;
-        /* Le firmware horodate a la reception de "+TEST: LEN", emise par le
-         * Wio-E5 en fin de demodulation. `t` est donc proche de la FIN de
-         * l'emission : la barre s'etend vers la gauche (tStart = t - ToA),
-         * pas vers la droite. */
+        /* The timestamp marks the END of reception: the bar extends left. */
         const t = frame.timestamp * 1000;
         return { frame, t, tStart: t - toaMs, bytes, toaMs };
       })
@@ -222,12 +171,9 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
 
   const bounds = useMemo(() => {
     if (points.length === 0) return null;
-    /* La premiere barre commence a son tStart (debut estime), la derniere
-     * finit a son t (fin horodatee). */
     const first = points[0].tStart;
     const last = points[points.length - 1].t;
-    /* Capture instantanee (une seule trame, ou rafale tres courte) : on
-     * force une fenetre minimale, sinon l'echelle serait degeneree. */
+    /* A single frame or a very short burst would give a degenerate scale. */
     const span = Math.max(last - first, MIN_SPAN_MS);
     const pad = span * PADDING_RATIO;
     return { start: first - pad, end: last + pad };
@@ -235,22 +181,14 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
 
   const activeView = view ?? bounds;
 
-  /* Placement des curseurs aux quarts de la plage. Se declenche quand on
-   * passe de zero a des trames (montage, chargement de capture), pas a
-   * chaque trame live — sinon les curseurs sauteraient en continu, la
-   * borne haute de `bounds` avancant a chaque reception. On garde donc les
-   * curseurs des qu'il y en a, et on ne (re)place que sur une transition
-   * vide -> non vide. */
+  /* Re-place cursors only on a new capture, not on every live frame. */
   const prevStart = useRef<number | null>(null);
   useEffect(() => {
     if (!bounds) {
       prevStart.current = null;
       return;
     }
-    /* Debut de plage inchange = meme capture qui s'etend en live : on ne
-     * touche pas aux curseurs. Debut different = nouvelle capture (ou
-     * premiere) : on les (re)place. La borne basse ne bouge pas en live,
-     * les nouvelles trames n'allongeant que la fin. */
+    /* Live frames only extend the end, so a changed start means a new capture. */
     if (prevStart.current === null || Math.abs(bounds.start - prevStart.current) > 1) {
       const span = bounds.end - bounds.start;
       setCursors({ a: bounds.start + span * 0.25, b: bounds.start + span * 0.75 });
@@ -258,8 +196,6 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
     prevStart.current = bounds.start;
   }, [bounds]);
 
-  /* Mesure A→B : ecart temporel et nombre de trames dont l'instant tombe
-   * dans l'intervalle. */
   const measure = useMemo(() => {
     if (!cursors) return null;
     const from = Math.min(cursors.a, cursors.b);
@@ -283,10 +219,7 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
     return () => observer.disconnect();
   }, []);
 
-  /* Selection venue d'ailleurs (clic dans le tableau) : on ne recentre que
-   * si la trame est hors de la vue courante. Recentrer systematiquement
-   * ferait sauter la timeline a chaque clic, y compris quand la trame
-   * etait deja visible. */
+  /* External selection: recenter only if the frame is out of view. */
   useEffect(() => {
     if (!view || !selectedFrameId) return;
     const target = points.find(p => p.frame.id === selectedFrameId);
@@ -305,7 +238,7 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
     [activeView, size.width]
   );
 
-  /* ---------- Rendu ---------- */
+  /* ---------- Rendering ---------- */
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !activeView || size.width === 0) return;
@@ -315,15 +248,13 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
     canvas.height = size.height * dpr;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    /* setTransform et non scale : scale se cumule d'un rendu au suivant,
-     * le contenu finissait dessine hors cadre. */
+    /* setTransform, not scale: scale accumulates across renders. */
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, size.width, size.height);
 
     const plotH = size.height - AXIS_HEIGHT;
     const spanMs = activeView.end - activeView.start;
 
-    /* --- Graduations --- */
     const targetTicks = Math.max(2, Math.floor(size.width / 130));
     const step = niceStep(spanMs / targetTicks);
     const firstTick = Math.ceil(activeView.start / step) * step;
@@ -344,21 +275,16 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
       ctx.fillText(formatAxisLabel(t, step), x, plotH + 4);
     }
 
-    /* Ligne de base */
     ctx.strokeStyle = 'rgba(255,255,255,0.10)';
     ctx.beginPath();
     ctx.moveTo(0, Math.round(plotH) + 0.5);
     ctx.lineTo(size.width, Math.round(plotH) + 0.5);
     ctx.stroke();
 
-    /* --- Trames ---
-     * Largeur = Time on Air (occupation reelle du canal), hauteur =
-     * taille du payload. Deux trames qui se chevauchent a l'ecran se
-     * chevauchent donc reellement sur l'air. */
+    /* Width = time on air, height = payload size: on-screen overlap is real on-air overlap. */
     const baseline = plotH - 4;
     const usableH = baseline - 6;
     for (const p of points) {
-      /* La barre va de tStart (debut estime) a t (fin horodatee). */
       const x = toX(p.tStart);
       const w = Math.max(MIN_FRAME_PX, toX(p.t) - x);
       if (x + w < -2 || x > size.width + 2) continue;
@@ -379,7 +305,6 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
       }
     }
 
-    /* --- Curseurs de mesure --- */
     if (measure) {
       const xa = toX(measure.from);
       const xb = toX(measure.to);
@@ -427,7 +352,6 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
       for (const p of points) {
         const x0 = toX(p.tStart);
         const x1 = Math.max(x0 + MIN_FRAME_PX, toX(p.t));
-        /* Distance au rectangle : nulle si le curseur est dedans. */
         const d = x < x0 ? x0 - x : x > x1 ? x - x1 : 0;
         if (d <= bestDist) {
           bestDist = d;
@@ -439,8 +363,7 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
     [points, activeView, toX]
   );
 
-  /* Attache native : React enregistre onWheel en passif, ou preventDefault
-   * est ignore — la page defilerait en meme temps qu'on zoome. */
+  /* Native listener: React's onWheel is passive, so preventDefault would be ignored. */
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -451,7 +374,7 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
       const rect = canvas.getBoundingClientRect();
       const ratio = (e.clientX - rect.left) / size.width;
       const span = activeView.end - activeView.start;
-      /* Zoom centre sur le curseur : le point sous la souris reste fixe. */
+      /* Zoom anchored on the mouse position. */
       const factor = e.deltaY > 0 ? 1.25 : 0.8;
       const newSpan = Math.max(MIN_SPAN_MS, span * factor);
       const anchor = activeView.start + span * ratio;
@@ -465,7 +388,6 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
     return () => canvas.removeEventListener('wheel', onWheel);
   }, [activeView, size.width]);
 
-  /* Curseur sous la souris, s'il y en a un dans la zone de saisie. */
   const cursorAt = useCallback(
     (clientX: number): 'a' | 'b' | null => {
       const canvas = canvasRef.current;
@@ -482,7 +404,7 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
       if (!activeView) return;
-      /* Attraper un curseur prime sur le pan de la vue. */
+      /* Grabbing a cursor takes priority over panning. */
       const grabbed = cursorAt(e.clientX);
       if (grabbed) {
         cursorDragRef.current = grabbed;
@@ -498,10 +420,7 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
     [activeView, cursorAt]
   );
 
-  /* Aimantation : convertit une position pixel en temps, puis colle au
-   * bord de trame (debut ou fin = debut + ToA) le plus proche s'il est a
-   * moins de SNAP_PX. Sinon renvoie le temps libre. Le seuil est en pixels
-   * pour rester constant quel que soit le zoom. */
+  /* Threshold in pixels so snapping feels the same at any zoom. */
   const snapTime = useCallback(
     (x: number): number => {
       if (!activeView || size.width === 0) return 0;
@@ -555,7 +474,7 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
-      /* Ni un pan ni un deplacement de curseur ne valent selection. */
+      /* A pan or cursor drag is not a selection. */
       if (dragRef.current?.moved || cursorDragRef.current) return;
       const frame = frameAt(e.clientX);
       if (frame) onSelectFrame(frame);
@@ -565,8 +484,6 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
 
   const resetView = useCallback(() => setView(null), []);
 
-  /* Recadre les curseurs sur la vue courante : pratique apres un zoom qui
-   * les a laisses hors champ. */
   const centerCursors = useCallback(() => {
     if (!activeView) return;
     const span = activeView.end - activeView.start;
@@ -584,19 +501,15 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
       style={{ height }}
       className="flex-shrink-0 flex flex-col rounded-card bg-surface border border-[rgba(255,255,255,0.04)] shadow-subtle"
     >
-      {/* Poignee de redimensionnement : bande fine en haut du panneau. */}
       <div
         onMouseDown={startResize}
         className="group h-2 flex-shrink-0 cursor-row-resize flex items-center justify-center"
-        title="Glisser pour redimensionner"
+        title="Drag to resize"
       >
         <div className="w-10 h-[3px] rounded-full bg-border group-hover:bg-brand/50 transition-colors duration-200" />
       </div>
 
-      {/* En-tete a structure fixe : chaque zone garde sa place, les
-        * elements se contentent d'etre actifs ou non. Aucune apparition/
-        * disparition qui ferait osciller la ligne. Les infos de survol ont
-        * ete retirees : elles font double emploi avec le panneau de detail. */}
+      {/* Fixed layout: items toggle enabled state but never appear/disappear, so the row never shifts. */}
       <div className="flex flex-shrink-0 items-center justify-between px-4 gap-4">
         <div className="flex items-baseline gap-3 min-w-0">
           <span className="text-[11px] font-medium text-text-secondary uppercase tracking-wider">
@@ -605,7 +518,7 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
           <span className="font-mono text-[11px] text-text-muted">{spanLabel || '—'}</span>
           <span className="font-mono text-[12px] text-brand whitespace-nowrap">
             {measure
-              ? `Δ A→B ${formatDuration(measure.deltaMs)} · ${measure.count} trame${measure.count > 1 ? 's' : ''}`
+              ? `Δ A→B ${formatDuration(measure.deltaMs)} · ${measure.count} frame${measure.count !== 1 ? 's' : ''}`
               : ''}
           </span>
         </div>
@@ -616,14 +529,14 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
             disabled={!cursors}
             className="px-2 py-0.5 bg-overlay text-text-secondary rounded-element text-[11px] font-medium whitespace-nowrap hover:bg-brand/10 hover:text-brand disabled:opacity-30 disabled:hover:bg-overlay disabled:hover:text-text-secondary transition-colors duration-200"
           >
-            Recadrer curseurs
+            Center cursors
           </button>
           <button
             onClick={resetView}
             disabled={!view}
             className="px-2 py-0.5 bg-overlay text-text-secondary rounded-element text-[11px] font-medium whitespace-nowrap hover:bg-brand/10 hover:text-brand disabled:opacity-30 disabled:hover:bg-overlay disabled:hover:text-text-secondary transition-colors duration-200"
           >
-            Vue complete
+            Fit all
           </button>
         </div>
       </div>
@@ -631,7 +544,7 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
       <div ref={wrapRef} className="relative flex-1 min-h-0 mx-2 mb-2">
         {frames.length === 0 ? (
           <div className="absolute inset-0 flex items-center justify-center">
-            <span className="text-[12px] text-text-muted">Aucune trame</span>
+            <span className="text-[12px] text-text-muted">No frames</span>
           </div>
         ) : (
           <canvas

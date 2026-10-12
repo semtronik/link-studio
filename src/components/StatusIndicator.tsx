@@ -27,9 +27,9 @@ function getPercent(value: number, min: number, max: number): number {
 }
 
 const LEVEL_LABELS: Record<SignalLevel, string> = {
-  good: 'bon',
-  medium: 'moyen',
-  bad: 'faible',
+  good: 'good',
+  medium: 'fair',
+  bad: 'weak',
 };
 
 export function StatusIndicator({ value, type }: StatusIndicatorProps) {

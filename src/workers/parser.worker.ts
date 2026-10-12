@@ -11,23 +11,22 @@ function loadParser(code: string) {
     const obj = new Function('return (' + code + ')')();
 
     if (!obj || typeof obj.name !== 'string') {
-      respond({ type: 'load-error', error: 'Le parseur doit exporter un objet avec une propriété "name" (string)' });
+      respond({ type: 'load-error', error: 'Parser must export an object with a "name" property (string)' });
       return;
     }
     if (typeof obj.decode !== 'function') {
-      respond({ type: 'load-error', error: 'Le parseur doit exporter une fonction "decode"' });
+      respond({ type: 'load-error', error: 'Parser must export a "decode" function' });
       return;
     }
 
-    // Test de validation : decode avec un hex de test
     const testResult = obj.decode('00', { timestamp: 0 });
     if (!testResult || !Array.isArray(testResult.fields)) {
-      respond({ type: 'load-error', error: 'decode() doit retourner un objet avec "fields" (array)' });
+      respond({ type: 'load-error', error: 'decode() must return an object with "fields" (array)' });
       return;
     }
 
     if (obj.analyze !== undefined && typeof obj.analyze !== 'function') {
-      respond({ type: 'load-error', error: '"analyze" doit être une fonction si présent' });
+      respond({ type: 'load-error', error: '"analyze" must be a function when present' });
       return;
     }
 
@@ -40,43 +39,43 @@ function loadParser(code: string) {
       hasAnalyze: typeof obj.analyze === 'function',
     });
   } catch (err) {
-    respond({ type: 'load-error', error: `Erreur de chargement : ${err instanceof Error ? err.message : String(err)}` });
+    respond({ type: 'load-error', error: `Load error: ${err instanceof Error ? err.message : String(err)}` });
   }
 }
 
 function decodeFrame(id: string, hex: string, context: { timestamp: number; rssi?: number; snr?: number }) {
   if (!parser) {
-    respond({ type: 'decode-error', id, error: 'Aucun parseur chargé' });
+    respond({ type: 'decode-error', id, error: 'No parser loaded' });
     return;
   }
 
   try {
     const result = parser.decode(hex, context);
     if (!result || !Array.isArray(result.fields)) {
-      respond({ type: 'decode-error', id, error: 'decode() a retourné un résultat invalide' });
+      respond({ type: 'decode-error', id, error: 'decode() returned an invalid result' });
       return;
     }
     respond({ type: 'decoded', id, result });
   } catch (err) {
-    respond({ type: 'decode-error', id, error: `Erreur decode : ${err instanceof Error ? err.message : String(err)}` });
+    respond({ type: 'decode-error', id, error: `Decode error: ${err instanceof Error ? err.message : String(err)}` });
   }
 }
 
 function analyzeFrames(frames: Array<{ id: string; hex: string; timestamp: number; decoded: any }>) {
   if (!parser || typeof parser.analyze !== 'function') {
-    respond({ type: 'analyze-error', error: 'Le parseur ne supporte pas analyze()' });
+    respond({ type: 'analyze-error', error: 'Parser does not support analyze()' });
     return;
   }
 
   try {
     const result = parser.analyze(frames);
     if (!result || typeof result.annotations !== 'object' || !Array.isArray(result.metrics)) {
-      respond({ type: 'analyze-error', error: 'analyze() doit retourner { annotations, metrics }' });
+      respond({ type: 'analyze-error', error: 'analyze() must return { annotations, metrics }' });
       return;
     }
     respond({ type: 'analyzed', result });
   } catch (err) {
-    respond({ type: 'analyze-error', error: `Erreur analyze : ${err instanceof Error ? err.message : String(err)}` });
+    respond({ type: 'analyze-error', error: `Analyze error: ${err instanceof Error ? err.message : String(err)}` });
   }
 }
 

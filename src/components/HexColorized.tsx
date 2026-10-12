@@ -25,22 +25,12 @@ interface HexColorizedProps {
   highlightedField?: string | null;
   onHighlightField?: (fieldName: string | null) => void;
   showLegend?: boolean;
-  /* Mode ligne unique : pas de retour a la ligne, et le payload est
-   * coupe a maxBytes octets. Utilise dans le tableau de trames, ou une
-   * trame de 255 octets ne doit ni faire grandir sa ligne ni generer
-   * 255 spans par trame. Le panneau de detail garde le rendu complet
-   * multi-lignes par defaut. */
   singleLine?: boolean;
-  /* Nombre d'octets rendus au maximum. Au-dela, la suite est remplacee
-   * par un marqueur d'ellipse. La taille exacte reste lisible dans la
-   * colonne OCTETS du tableau. */
   maxBytes?: number;
 }
 
 export function HexColorized({ hex, fields, highlightedField, onHighlightField, showLegend, singleLine, maxBytes }: HexColorizedProps) {
-  /* La coupe est faite ici plutot que masquee en CSS : une trame de 255
-   * octets ne doit pas generer 255 spans par ligne de tableau. L'appelant
-   * signale lui-meme le reste tronque (cf. FrameTable). */
+  /* Truncated here, not hidden in CSS, to avoid 255 spans per table row. The caller shows the ellipsis. */
   const bytes = useMemo(() => {
     const all = hex.match(/.{1,2}/g) || [];
     return maxBytes != null && all.length > maxBytes ? all.slice(0, maxBytes) : all;

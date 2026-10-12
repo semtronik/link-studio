@@ -1,6 +1,6 @@
 import type { Frame } from './lora';
 
-// --- Contrat du parseur ---
+// --- Parser contract ---
 
 export interface DecodeContext {
   timestamp: number;
@@ -12,7 +12,7 @@ export interface Field {
   name: string;
   value: any;
   unit?: string;
-  bytes: [number, number]; // [début, fin[ (0-indexé, en octets)
+  bytes: [number, number]; // [start, end), 0-based byte offsets
   color?: 'blue' | 'green' | 'yellow' | 'red' | 'purple' | 'gray';
 }
 
@@ -22,7 +22,7 @@ export interface DecodeResult {
   summary?: string;
 }
 
-// --- Résultat analyze() ---
+// --- analyze() result ---
 
 export interface Annotation {
   status: 'ok' | 'error' | 'warning' | 'linked';
@@ -39,7 +39,7 @@ export interface AnalyzeResult {
   metrics: Metric[];
 }
 
-// --- État dans l'app ---
+// --- App state ---
 
 export interface ParserInfo {
   name: string;

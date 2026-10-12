@@ -1,16 +1,16 @@
 {
-  "name": "lft-app",
+  "name": "link-studio",
   "version": "1.0.1",
-  "description": "Desktop companion app for the LoRa Field Toolkit (LFT) — visualize, configure and analyze LoRa P2P radio links.",
+  "description": "Desktop app for the Semtronik Link devices — drive the device, retrieve recordings and decode LoRa frames.",
   "license": "MIT",
   "author": "Semtronik <contact@semtronik.com>",
   "repository": {
     "type": "git",
-    "url": "https://github.com/semtronik/lft-app.git"
+    "url": "https://github.com/semtronik/link-studio.git"
   },
-  "homepage": "https://github.com/semtronik/lft-app",
+  "homepage": "https://github.com/semtronik/link-studio",
   "bugs": {
-    "url": "https://github.com/semtronik/lft-app/issues"
+    "url": "https://github.com/semtronik/link-studio/issues"
   },
   "type": "module",
   "scripts": {
