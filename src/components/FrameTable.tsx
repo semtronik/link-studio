@@ -1,5 +1,5 @@
 import { useRef, useEffect, useCallback, useMemo, useState } from 'react';
-import { StatusIndicator } from './StatusIndicator';
+import { MarginValue } from './MarginValue';
 import { HexColorized } from './HexColorized';
 import type { DecodedFrame, Annotation } from '../types/parser';
 
@@ -44,7 +44,7 @@ const HEADER_CLASSES =
 
 /* Shared by the header and each row: this grid is what aligns the columns. */
 const GRID_CLASSES =
-  'grid grid-cols-[minmax(260px,1fr)_80px_140px_140px] items-center gap-4';
+  'grid grid-cols-[minmax(260px,1fr)_60px_100px_90px_80px] items-center gap-4';
 
 const PAYLOAD_PREVIEW_BYTES = 8;
 
@@ -176,6 +176,7 @@ export function FrameTable({ frames, annotations, selectedFrameId, onSelectFrame
         <div className={`${HEADER_CLASSES} ${GRID_CLASSES} sticky top-0 z-10`}>
           <span>Frame</span>
           <span>Bytes</span>
+          <span title="SNR above the lowest the spreading factor demodulates: ≥ 10 dB good, 3 to 10 fair, below 3 poor">Margin</span>
           <span>RSSI</span>
           <span>SNR</span>
         </div>
@@ -226,18 +227,17 @@ export function FrameTable({ frames, annotations, selectedFrameId, onSelectFrame
                     {byteCount || '-'}
                   </span>
                   <span>
-                    {frame.rssi != null ? (
-                      <StatusIndicator value={frame.rssi} type="rssi" />
+                    {frame.margin != null ? (
+                      <MarginValue value={frame.margin} />
                     ) : (
                       <span className="text-text-muted">-</span>
                     )}
                   </span>
-                  <span>
-                    {frame.snr != null ? (
-                      <StatusIndicator value={frame.snr} type="snr" />
-                    ) : (
-                      <span className="text-text-muted">-</span>
-                    )}
+                  <span className="font-mono text-[13px] text-text-secondary whitespace-nowrap">
+                    {frame.rssi != null ? `${frame.rssi} dBm` : <span className="text-text-muted">-</span>}
+                  </span>
+                  <span className="font-mono text-[13px] text-text-secondary whitespace-nowrap">
+                    {frame.snr != null ? `${frame.snr.toFixed(1)} dB` : <span className="text-text-muted">-</span>}
                   </span>
                 </div>
 

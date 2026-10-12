@@ -1,6 +1,6 @@
 import { useState, Fragment } from 'react';
 import { HexColorized } from './HexColorized';
-import { formatToa } from '../utils/journal';
+import { formatToa, marginClass } from '../utils/journal';
 import type { DecodedFrame, Field, Annotation } from '../types/parser';
 
 interface DetailPanelProps {
@@ -27,6 +27,7 @@ function measurements(frame: DecodedFrame): Array<[string, string]> {
     if (line.rssi_dbm != null) out.push(['RSSI', `${line.rssi_dbm} dBm`]);
     if (line.signal_dbm != null) out.push(['Signal', `${line.signal_dbm} dBm`]);
     if (line.snr_db != null) out.push(['SNR', `${line.snr_db} dB`]);
+    if (frame.margin != null) out.push(['Margin', `${frame.margin.toFixed(1)} dB, ${marginClass(frame.margin)}`]);
     if (line.noise_dbm != null) out.push(['Noise before', `${line.noise_dbm} dBm`]);
     if (line.inst_min_dbm != null && line.inst_max_dbm != null) {
       out.push(['During frame', `${line.inst_min_dbm} to ${line.inst_max_dbm} dBm (${line.inst_n ?? '?'} readings)`]);

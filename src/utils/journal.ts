@@ -1,8 +1,26 @@
 import type { Frame } from '../types/journal';
 import type { Profile, RecordLine, SessionLine } from '../types/recording';
 
-/** Journal row for a recording line; null for `session` and `end`. */
-export function lineToFrame(line: RecordLine): Frame | null {
+/** Lowest SNR the SX1262 demodulates, SF5 to SF12 (link_radio.c). */
+export function snrLimitDb(sf: number): number {
+  return sf >= 5 && sf <= 12 ? -2.5 * (sf - 4) : -7.5;
+}
+
+/* Margin classes of the device (link_radio.h), in dB. */
+export const MARGIN_GOOD_DB = 10;
+export const MARGIN_FAIR_DB = 3;
+
+export type MarginClass = 'good' | 'fair' | 'poor';
+
+export function marginClass(marginDb: number): MarginClass {
+  if (marginDb >= MARGIN_GOOD_DB) return 'good';
+  if (marginDb >= MARGIN_FAIR_DB) return 'fair';
+  return 'poor';
+}
+
+/** Journal row for a recording line; null for `session` and `end`.
+ *  `sf` is the session's, for the margin. */
+export function lineToFrame(line: RecordLine, sf?: number): Frame | null {
   const id = crypto.randomUUID();
   switch (line.type) {
     case 'rx':
@@ -12,6 +30,7 @@ export function lineToFrame(line: RecordLine): Frame | null {
         timestamp: (line.ts ?? 0) / 1000,
         rssi: line.rssi_dbm,
         snr: line.snr_db,
+        margin: line.snr_db != null && sf != null ? line.snr_db - snrLimitDb(sf) : undefined,
         toaMs: line.toa_ms,
         status: line.status,
       };
@@ -32,8 +51,16 @@ export function lineToFrame(line: RecordLine): Frame | null {
   }
 }
 
+/** Each frame takes its SF from the `session` line before it. */
 export function linesToFrames(lines: RecordLine[]): Frame[] {
-  return lines.map(lineToFrame).filter((f): f is Frame => f !== null);
+  const frames: Frame[] = [];
+  let sf: number | undefined;
+  for (const line of lines) {
+    if (line.type === 'session') sf = line.profile.sf;
+    const frame = lineToFrame(line, sf);
+    if (frame) frames.push(frame);
+  }
+  return frames;
 }
 
 /** Only payloads worth decoding: a CRC error's bytes are corrupt. */

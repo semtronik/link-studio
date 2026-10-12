@@ -18,7 +18,7 @@ import { writeTextFile } from '@tauri-apps/plugin-fs';
 const BUTTON = 'px-3 py-1 rounded-element text-sm font-medium whitespace-nowrap transition-all duration-200';
 
 export function FrameViewer() {
-  const { connected, view, liveSessionId, onShow, onLine, showLive, newSession, transmit, getViewLines } = useSerialContext();
+  const { connected, profile, view, liveSessionId, onShow, onLine, showLive, newSession, transmit, getViewLines } = useSerialContext();
   const { frames, paused, annotations, metrics, addFrame, replaceFrames, setPaused, setAnnotations, setMetrics } = useFrameContext();
   const { addToast } = useToast();
   const { parserInfo, parserError, decodeFrame, analyzeFrames, importParser, loadRawParser } = useParser();
@@ -83,13 +83,15 @@ export function FrameViewer() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Live lines belong to the running session, whose SF is the device's.
+  const liveSf = profile?.sf;
   useEffect(() => {
     if (paused) return;
     return onLine((line) => {
-      const frame = lineToFrame(line);
+      const frame = lineToFrame(line, liveSf);
       if (frame) decode(frame).then(addFrame);
     });
-  }, [paused, onLine, decode, addFrame]);
+  }, [paused, onLine, decode, addFrame, liveSf]);
 
   // Re-decode all frames when parser changes
   useEffect(() => {

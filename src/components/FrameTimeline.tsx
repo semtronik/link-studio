@@ -1,5 +1,6 @@
 import { useRef, useEffect, useCallback, useMemo, useState } from 'react';
 import type { DecodedFrame } from '../types/parser';
+import { marginClass } from '../utils/journal';
 
 interface FrameTimelineProps {
   frames: DecodedFrame[];
@@ -34,21 +35,17 @@ function loadStoredHeight(): number {
 
 /* Frames are placed by timestamp, not by rank, so bursts and gaps stay visible. */
 
-/* Same thresholds as StatusIndicator. */
-const RSSI_GOOD = -80;
-const RSSI_MEDIUM = -100;
-
+/* The device's palette (link_theme.c): margin classes, brand blue for our own frames. */
 const COLOR_GOOD = '#4ADE80';
 const COLOR_MEDIUM = '#FBBF24';
 const COLOR_BAD = '#F87171';
 const COLOR_UNKNOWN = '#64748B';
-const COLOR_TX = '#A78BFA';
+const COLOR_TX = '#47ABFF';
 
-function rssiColor(rssi?: number): string {
-  if (rssi == null) return COLOR_UNKNOWN;
-  if (rssi > RSSI_GOOD) return COLOR_GOOD;
-  if (rssi > RSSI_MEDIUM) return COLOR_MEDIUM;
-  return COLOR_BAD;
+function marginColor(margin?: number): string {
+  if (margin == null) return COLOR_UNKNOWN;
+  const cls = marginClass(margin);
+  return cls === 'good' ? COLOR_GOOD : cls === 'fair' ? COLOR_MEDIUM : COLOR_BAD;
 }
 
 const AXIS_HEIGHT = 28;
@@ -295,7 +292,7 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame }: FrameT
       ctx.fillStyle = isSelected ? '#47ABFF'
         : p.frame.kind === 'tx' ? COLOR_TX
         : p.frame.status === 'crc_err' ? COLOR_BAD
-        : rssiColor(p.frame.rssi);
+        : marginColor(p.frame.margin);
       ctx.globalAlpha = isSelected ? 1 : 0.75;
       ctx.fillRect(x, baseline - h, w, h);
       ctx.globalAlpha = 1;

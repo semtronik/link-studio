@@ -10,6 +10,8 @@ export interface Frame {
   timestamp: number;
   rssi?: number;
   snr?: number;
+  /** dB above the lowest SNR the session's SF demodulates. */
+  margin?: number;
   toaMs?: number;
   /** rx: reception status; tx: how the transmission ended. */
   status?: RxLine['status'] | TxLine['result'];

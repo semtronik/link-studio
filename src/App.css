@@ -9,7 +9,7 @@
   --color-brand-100: rgba(71, 171, 255, 0.12);
   --color-brand-200: #B3D9FF;
 
-  /* Semantic — RSSI/SNR, themed through --t-rssi-*. */
+  /* Margin classes, as on the device (link_theme.c); themed through --t-rssi-*. */
   --color-rssi-good: var(--t-rssi-good);
   --color-rssi-medium: var(--t-rssi-medium);
   --color-rssi-bad: var(--t-rssi-bad);
@@ -52,10 +52,10 @@
   --t-shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.06);
   --t-shadow-medium: 0 4px 8px rgba(0, 0, 0, 0.08);
   --t-shadow-elevated: 0 8px 24px rgba(0, 0, 0, 0.12);
-  /* RSSI: darker shades to stay readable on white (Tailwind 600). */
+  /* Device light palette. */
   --t-rssi-good: #16A34A;
-  --t-rssi-medium: #D97706;
-  --t-rssi-bad: #DC2626;
+  --t-rssi-medium: #EA580C;
+  --t-rssi-bad: #C81E1E;
   color-scheme: light;
 }
 
@@ -72,7 +72,7 @@
   --t-shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.3);
   --t-shadow-medium: 0 4px 8px rgba(0, 0, 0, 0.4);
   --t-shadow-elevated: 0 8px 24px rgba(0, 0, 0, 0.5);
-  /* RSSI: bright shades for the dark background (Tailwind 400). */
+  /* Device dark palette (Tailwind 400). */
   --t-rssi-good: #4ADE80;
   --t-rssi-medium: #FBBF24;
   --t-rssi-bad: #F87171;

@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useFrameContext } from '../contexts/FrameContext';
-import { ProgressiveValue } from './ProgressiveValue';
+import { MARGIN_TEXT } from './MarginValue';
+import { marginClass, MARGIN_FAIR_DB, MARGIN_GOOD_DB, type MarginClass } from '../utils/journal';
+
+const MARGIN_ROWS: Array<[MarginClass, string]> = [
+  ['good', `≥ ${MARGIN_GOOD_DB} dB`],
+  ['fair', `${MARGIN_FAIR_DB} to ${MARGIN_GOOD_DB} dB`],
+  ['poor', `< ${MARGIN_FAIR_DB} dB`],
+];
 
 function formatLastFrameAge(ageSeconds: number): { text: string; level: 'normal' | 'warning' | 'alert' } {
   let level: 'normal' | 'warning' | 'alert' = 'normal';
@@ -34,17 +41,21 @@ export function StatisticsCard() {
     return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
   }, [frames]);
 
-  /* Errors count as receptions: the radio started one (recording.md). */
+  /* As the device counts them (link_stats.c): margin classes for intact frames only;
+   * errors count as receptions, the radio started one. */
   const counts = useMemo(() => {
     let ok = 0, errors = 0, sent = 0;
+    const margin: Record<MarginClass, number> = { good: 0, fair: 0, poor: 0 };
     for (const f of frames) {
       if (f.kind === 'tx') sent++;
       else if (f.kind === 'rx') {
-        if (f.status === 'ok') ok++;
-        else errors++;
+        if (f.status === 'ok') {
+          ok++;
+          if (f.margin != null) margin[marginClass(f.margin)]++;
+        } else errors++;
       }
     }
-    return { ok, errors, sent };
+    return { ok, errors, sent, margin };
   }, [frames]);
 
   /* Re-render every 10 s to refresh the "last frame" age. */
@@ -85,6 +96,24 @@ export function StatisticsCard() {
           </span>
         </div>
 
+        {counts.ok > 0 && (
+          <div className="py-2">
+            <div className="text-[13px] text-text-secondary mb-1.5">Margin</div>
+            {MARGIN_ROWS.map(([cls, label]) => (
+              <div key={cls} className="flex justify-between items-center py-0.5">
+                <span className={`inline-flex items-center gap-1.5 text-[12px] ${MARGIN_TEXT[cls]}`}>
+                  <span className="w-2 h-2 rounded-full bg-current" />
+                  {label}
+                </span>
+                <span className="font-mono text-[13px] text-text-primary">
+                  {counts.margin[cls]}
+                  <span className="text-text-muted"> · {Math.round((counts.margin[cls] / counts.ok) * 100)} %</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
         <div className="flex justify-between items-center py-2">
           <span className="text-[13px] text-text-secondary">Sent</span>
           <span className="font-mono text-[13px] text-text-primary">{counts.sent}</span>
@@ -92,20 +121,16 @@ export function StatisticsCard() {
 
         <div className="flex justify-between items-center py-2">
           <span className="text-[13px] text-text-secondary">Avg RSSI</span>
-          {avgRssi != null ? (
-            <ProgressiveValue value={avgRssi} type="rssi" decimals={0} unit="dBm" />
-          ) : (
-            <span className="font-mono text-[13px] text-text-muted">--</span>
-          )}
+          <span className="font-mono text-[13px] text-text-primary">
+            {avgRssi != null ? `${avgRssi.toFixed(0)} dBm` : '--'}
+          </span>
         </div>
 
         <div className="flex justify-between items-center py-2">
           <span className="text-[13px] text-text-secondary">Avg SNR</span>
-          {avgSnr != null ? (
-            <ProgressiveValue value={avgSnr} type="snr" decimals={1} unit="dB" />
-          ) : (
-            <span className="font-mono text-[13px] text-text-muted">--</span>
-          )}
+          <span className="font-mono text-[13px] text-text-primary">
+            {avgSnr != null ? `${avgSnr.toFixed(1)} dB` : '--'}
+          </span>
         </div>
 
         {lastFrameDisplay && (
