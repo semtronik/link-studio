@@ -1,5 +1,7 @@
 # Link Studio
 
+![Link Studio showing a recorded Link-LR session: radio profile, sessions on the device, journal with link margin, frame detail and timeline](docs/images/link-studio_session-58.png)
+
 Desktop app for the **Semtronik Link** devices. Part of the
 [Semtronik Link project](https://github.com/semtronik/link).
 
