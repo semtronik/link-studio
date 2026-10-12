@@ -1,6 +1,6 @@
 {
   "name": "link-studio",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "description": "Desktop app for the Semtronik Link devices — drive the device, retrieve recordings and decode LoRa frames.",
   "license": "MIT",
   "author": "Semtronik <contact@semtronik.com>",
