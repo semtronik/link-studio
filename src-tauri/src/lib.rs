@@ -1,7 +1,6 @@
 mod app_logger;
 mod commands;
 mod firmware_manager;
-mod frame_store;
 
 mod lora_protocol;
 mod port_scanner;
@@ -40,18 +39,15 @@ pub fn run() {
             commands::refresh_ports_now,
             commands::serial_connect,
             commands::serial_disconnect,
-            commands::send_command,
-            commands::apply_config,
-            commands::get_config,
-            commands::get_frames,
-            commands::get_stats,
-            commands::clear_frames,
-            commands::load_capture,
-            commands::get_valid_params,
-            commands::get_device_version,
-            commands::sync_time,
-            commands::flash_firmware,
+            commands::get_profile,
+            commands::set_profile,
+            commands::transmit,
+            commands::get_sessions,
+            commands::get_session,
+            commands::erase_sessions,
             commands::get_events,
+            commands::get_device_version,
+            commands::flash_firmware,
         ])
         .run(tauri::generate_context!())
         .expect("Failed to start the application");

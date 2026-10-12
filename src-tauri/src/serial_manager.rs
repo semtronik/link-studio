@@ -1,4 +1,3 @@
-use crate::frame_store::FrameStore;
 use crate::lora_protocol::*;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -7,7 +6,6 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tauri::ipc::Channel;
-use uuid::Uuid;
 
 const MAX_LINE_LEN: usize = 8192;
 
@@ -267,18 +265,31 @@ mod tests {
     }
 }
 
+type Reply = Result<Incoming, String>;
+
+pub const STREAM_BUSY: &str = "Another transfer is in progress";
+
+/// A command whose reply spans several lines, bracketed by `phase` acks.
+struct Stream {
+    cmd: String,
+    tx: mpsc::Sender<Reply>,
+    begun: bool,
+    /// get_session on the running session: live lines before `begin` are
+    /// repeated in the stream.
+    drop_live_before_begin: bool,
+}
+
 pub struct SerialManager {
     port: Option<Box<dyn serialport::SerialPort>>,
     connected_path: Option<String>,
     connecting_path: Option<String>,
     stop_tx: Option<mpsc::Sender<()>>,
     reader_handle: Option<JoinHandle<()>>,
-    pub frame_store: FrameStore,
-    pub config: Option<LoRaConfig>,
-    cmd_queue: VecDeque<(u64, String, mpsc::Sender<Result<DeviceMessage, String>>)>,
+    cmd_queue: VecDeque<(u64, String, mpsc::Sender<Reply>)>,
     next_cmd_id: u64,
-    /// While Some, get_events acks and event lines go here instead of cmd_queue.
-    events_collector: Option<mpsc::Sender<Result<DeviceMessage, String>>>,
+    stream: Option<Stream>,
+    /// Running session, from get_sessions or the last live `session` line.
+    live_session_id: Option<u64>,
 }
 
 impl SerialManager {
@@ -289,11 +300,10 @@ impl SerialManager {
             connecting_path: None,
             stop_tx: None,
             reader_handle: None,
-            frame_store: FrameStore::new(),
-            config: None,
             cmd_queue: VecDeque::new(),
             next_cmd_id: 0,
-            events_collector: None,
+            stream: None,
+            live_session_id: None,
         }
     }
 
@@ -316,12 +326,19 @@ impl SerialManager {
             .or(self.connecting_path.as_deref())
     }
 
+    pub fn live_session_id(&self) -> Option<u64> {
+        self.live_session_id
+    }
+
+    pub fn set_live_session_id(&mut self, id: Option<u64>) {
+        self.live_session_id = id;
+    }
+
     /// Called with the lock held: `state` is for the reader thread only, never
     /// lock it here (deadlock).
     pub fn connect(
         &mut self,
         port_name: &str,
-        baud_rate: u32,
         channel: Channel<SerialEvent>,
         state: Arc<Mutex<SerialManager>>,
     ) -> Result<(), ConnectError> {
@@ -332,7 +349,8 @@ impl SerialManager {
             });
         }
 
-        let mut port = serialport::new(port_name, baud_rate)
+        // USB CDC ignores the baud rate.
+        let mut port = serialport::new(port_name, 115200)
             .timeout(std::time::Duration::from_millis(10))
             .open()
             .map_err(|e| classify_open_error(port_name, &e))?;
@@ -354,18 +372,20 @@ impl SerialManager {
         self.port = Some(port);
         self.connected_path = Some(port_name.to_string());
         self.stop_tx = Some(stop_tx);
+        self.live_session_id = None;
 
         let handle = std::thread::spawn(move || {
             let mut reader = BufReader::new(reader_port);
-            let mut line_buf = String::new();
+            // Bytes, not String: a read timing out mid-line keeps what it got,
+            // and the line completes on a later read.
+            let mut line_buf: Vec<u8> = Vec::new();
 
             loop {
                 if stop_rx.try_recv().is_ok() {
                     break;
                 }
 
-                line_buf.clear();
-                match reader.read_line(&mut line_buf) {
+                match reader.read_until(b'\n', &mut line_buf) {
                     Ok(0) => {
                         crate::log_warn("Disconnect (EOF on serial read)");
                         let _ = channel.send(SerialEvent::Disconnected);
@@ -374,25 +394,28 @@ impl SerialManager {
                         break;
                     }
                     Ok(_) => {
-                        if line_buf.len() > MAX_LINE_LEN {
-                            line_buf.clear();
+                        if line_buf.last() != Some(&b'\n') {
                             continue;
                         }
-
-                        let trimmed = line_buf.trim();
-                        if trimmed.is_empty() {
+                        let raw = std::mem::take(&mut line_buf);
+                        if raw.len() > MAX_LINE_LEN {
                             continue;
                         }
-
+                        let text = String::from_utf8_lossy(&raw);
+                        let trimmed = text.trim();
+                        if !trimmed.starts_with('{') {
+                            continue;
+                        }
                         // Parse outside the lock.
-                        let parsed = serde_json::from_str::<DeviceMessage>(trimmed);
-
-                        if let Ok(msg) = parsed {
+                        if let Some(msg) = parse_line(trimmed) {
                             let mut mgr = lock_or_recover(&state);
                             mgr.dispatch(msg, &channel);
                         }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        if line_buf.len() > MAX_LINE_LEN {
+                            line_buf.clear();
+                        }
                         continue;
                     }
                     Err(e) => {
@@ -411,300 +434,106 @@ impl SerialManager {
         Ok(())
     }
 
-    fn dispatch(&mut self, msg: DeviceMessage, channel: &Channel<SerialEvent>) {
-        fn now_secs() -> f64 {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64()
-        }
-
-        /// Above 1e12 the timestamp is in ms.
-        fn normalize_ts(ts: f64) -> f64 {
-            if ts > 1e12 { ts / 1000.0 } else { ts }
-        }
-
+    fn dispatch(&mut self, msg: Incoming, channel: &Channel<SerialEvent>) {
         match msg {
-            DeviceMessage::Packet {
-                ts,
-                rssi,
-                snr,
-                data,
-                ..
-            } => {
-                let timestamp = ts.map(normalize_ts).unwrap_or_else(now_secs);
-                let frame = FrameData {
-                    id: Uuid::new_v4().to_string(),
-                    frame_type: "frame".to_string(),
-                    hex: data.unwrap_or_default(),
-                    timestamp,
-                    rssi,
-                    snr,
-                };
-                self.frame_store.push(frame.clone());
-                let _ = channel.send(SerialEvent::Frame(frame));
-                let _ = channel.send(SerialEvent::Stats(self.frame_store.stats()));
-            }
-            DeviceMessage::Frame {
-                ts,
-                timestamp,
-                rssi,
-                snr,
-                hex,
-                data,
-                ..
-            } => {
-                let ts_val = ts.or(timestamp).map(normalize_ts).unwrap_or_else(now_secs);
-                let frame = FrameData {
-                    id: Uuid::new_v4().to_string(),
-                    frame_type: "frame".to_string(),
-                    hex: hex.or(data).unwrap_or_default(),
-                    timestamp: ts_val,
-                    rssi,
-                    snr,
-                };
-                self.frame_store.push(frame.clone());
-                let _ = channel.send(SerialEvent::Frame(frame));
-                let _ = channel.send(SerialEvent::Stats(self.frame_store.stats()));
-            }
-            DeviceMessage::Config {
-                freq,
-                sf,
-                bw,
-                drops,
-            } => {
-                let prev = self.config.clone().unwrap_or(LoRaConfig {
-                    freq: 868.0,
-                    sf: 7,
-                    bw: 125.0,
-                    drops: 0,
-                });
-                let config = LoRaConfig {
-                    freq: freq.unwrap_or(prev.freq),
-                    sf: sf.unwrap_or(prev.sf),
-                    bw: bw.unwrap_or(prev.bw),
-                    drops: drops.unwrap_or(prev.drops),
-                }.sanitized();
-                self.config = Some(config.clone());
-                let _ = channel.send(SerialEvent::Config(config));
-
-                if let Some((_, expected_cmd, _)) = self.cmd_queue.front() {
-                    if expected_cmd == "get_config" {
-                        let (_, _, tx) = self.cmd_queue.pop_front().unwrap();
-                        let _ = tx.send(Ok(DeviceMessage::Config {
-                            freq,
-                            sf,
-                            bw,
-                            drops,
-                        }));
+            Incoming::Record(line) => {
+                if let Some(s) = self.stream.as_ref() {
+                    if s.cmd == "get_session" {
+                        if s.begun {
+                            let _ = s.tx.send(Ok(Incoming::Record(line)));
+                            return;
+                        }
+                        if s.drop_live_before_begin {
+                            return;
+                        }
                     }
                 }
-            }
-            DeviceMessage::Ack { ref cmd, ref phase, .. } => {
-                if cmd == "get_events" && self.events_collector.is_some() {
-                    if let Some(tx) = self.events_collector.as_ref() {
-                        let _ = tx.send(Ok(msg.clone()));
-                    }
-                    if phase.as_deref() == Some("end") {
-                        self.events_collector = None;
-                    }
-                    return;
+                if line.get("type").and_then(|t| t.as_str()) == Some("session") {
+                    self.live_session_id = line.get("id").and_then(|v| v.as_u64());
                 }
-
-                // Matching by name is enough: commands are sent one at a time.
-                if let Some((_, expected_cmd, _)) = self.cmd_queue.front() {
-                    if expected_cmd == cmd {
-                        let (_, _, tx) = self.cmd_queue.pop_front().unwrap();
-                        let _ = tx.send(Ok(msg.clone()));
-                    }
+                let _ = channel.send(SerialEvent::Line(line));
+            }
+            Incoming::SessionInfo(_) => {
+                if let Some(s) = self.stream.as_ref() {
+                    let _ = s.tx.send(Ok(msg));
                 }
             }
-            DeviceMessage::Error { ref cmd, .. } => {
-                if cmd == "get_events" && self.events_collector.is_some() {
-                    if let Some(tx) = self.events_collector.as_ref() {
-                        let _ = tx.send(Ok(msg.clone()));
+            Incoming::Reply(ref reply) => match reply {
+                DeviceMessage::Ack { cmd, phase, .. } => {
+                    if self.stream.as_ref().is_some_and(|s| &s.cmd == cmd) {
+                        let s = self.stream.as_mut().unwrap();
+                        match phase.as_deref() {
+                            Some("begin") => s.begun = true,
+                            Some("end") => {
+                                let _ = s.tx.send(Ok(msg));
+                                self.stream = None;
+                                return;
+                            }
+                            _ => {}
+                        }
+                        let _ = s.tx.send(Ok(msg));
+                        return;
                     }
-                    self.events_collector = None;
-                    return;
+                    let cmd = cmd.clone();
+                    self.resolve(&cmd, msg);
                 }
-
-                if let Some((_, expected_cmd, _)) = self.cmd_queue.front() {
-                    if expected_cmd == cmd {
-                        let (_, _, tx) = self.cmd_queue.pop_front().unwrap();
-                        let _ = tx.send(Ok(msg.clone()));
+                DeviceMessage::Error { cmd, .. } => {
+                    if self.stream.as_ref().is_some_and(|s| &s.cmd == cmd) {
+                        let s = self.stream.take().unwrap();
+                        let _ = s.tx.send(Ok(msg));
+                        return;
+                    }
+                    let cmd = cmd.clone();
+                    self.resolve(&cmd, msg);
+                }
+                DeviceMessage::Event { .. } => {
+                    if let Some(s) = self.stream.as_ref() {
+                        let _ = s.tx.send(Ok(msg));
                     }
                 }
-            }
-            DeviceMessage::Event { .. } => {
-                if let Some(tx) = self.events_collector.as_ref() {
-                    let _ = tx.send(Ok(msg.clone()));
-                }
-            }
-            DeviceMessage::Time { .. } => {
-                if let Some((_, expected_cmd, _)) = self.cmd_queue.front() {
-                    if expected_cmd == "get_time" {
-                        let (_, _, tx) = self.cmd_queue.pop_front().unwrap();
-                        let _ = tx.send(Ok(msg.clone()));
-                    }
-                }
-            }
+                DeviceMessage::Time { .. } => self.resolve("get_time", msg),
+            },
         }
+    }
+
+    /// Matching by name is enough: commands are sent one at a time.
+    fn resolve(&mut self, cmd: &str, msg: Incoming) {
+        if self.cmd_queue.front().is_some_and(|(_, c, _)| c == cmd) {
+            let (_, _, tx) = self.cmd_queue.pop_front().unwrap();
+            let _ = tx.send(Ok(msg));
+        }
+    }
+
+    fn write_line(&mut self, json: &str) -> Result<(), String> {
+        let port = self.port.as_mut().ok_or("Not connected")?;
+        port.write_all(format!("{}\n", json).as_bytes())
+            .map_err(|e| format!("Write failed: {}", e))?;
+        port.flush().map_err(|e| format!("Flush failed: {}", e))
     }
 
     /// The caller must release the lock before waiting on the receiver.
-    pub fn prepare_command(
-        &mut self,
-        cmd: SerialCommand,
-    ) -> Result<(u64, mpsc::Receiver<Result<DeviceMessage, String>>), String> {
-        if !INTERNAL_COMMANDS.contains(&cmd.cmd.as_str()) {
-            return Err(format!("Unknown command: {}", cmd.cmd));
-        }
-
-        let port = self.port.as_mut().ok_or("Not connected")?;
-
-        let cmd_id = self.next_cmd_id;
-        self.next_cmd_id += 1;
-
-        let (tx, rx) = mpsc::channel();
-        self.cmd_queue.push_back((cmd_id, cmd.cmd.clone(), tx));
-
-        let json =
-            serde_json::to_string(&cmd).map_err(|e| format!("Serialization failed: {}", e))?;
-
-        port.write_all(format!("{}\n", json).as_bytes())
-            .map_err(|e| format!("Write failed: {}", e))?;
-        port.flush()
-            .map_err(|e| format!("Flush failed: {}", e))?;
-
-        Ok((cmd_id, rx))
-    }
-
-    pub fn send_command_safe(
-        state: &Arc<Mutex<SerialManager>>,
-        cmd: SerialCommand,
-    ) -> Result<DeviceMessage, String> {
-        Self::send_command_safe_with_retries(state, cmd, 1)
-    }
-
-    pub fn send_command_safe_with_retries(
-        state: &Arc<Mutex<SerialManager>>,
-        cmd: SerialCommand,
-        retries: u32,
-    ) -> Result<DeviceMessage, String> {
-        let timeout = std::time::Duration::from_secs(3);
-
-        for attempt in 0..=retries {
-            let cmd_clone = SerialCommand {
-                cmd: cmd.cmd.clone(),
-                value: cmd.value,
-            };
-            let cmd_name = cmd_clone.cmd.clone();
-
-            // A booting device rejects writes with os error 121: retry.
-            let (cmd_id, rx) = match {
-                let mut mgr = lock_or_recover(state);
-                mgr.prepare_command(cmd_clone)
-            } {
-                Ok(v) => v,
-                Err(e) => {
-                    if attempt < retries {
-                        eprintln!("[CMD] {} -> WRITE_ERR ({}), retry {}/{}", cmd_name, e, attempt + 1, retries);
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
-                        continue;
-                    } else {
-                        eprintln!("[CMD] {} -> WRITE_ERR final: {}", cmd_name, e);
-                        return Err(e);
-                    }
-                }
-            };
-
-            match rx.recv_timeout(timeout) {
-                Ok(result) => {
-                    if let Err(e) = &result {
-                        eprintln!("[CMD] {} -> ERR: {}", cmd_name, e);
-                    }
-                    return result;
-                }
-                Err(_) => {
-                    let mut mgr = lock_or_recover(state);
-                    mgr.cmd_queue.retain(|(id, _, _)| *id != cmd_id);
-
-                    if attempt < retries {
-                        eprintln!("[CMD] {} -> TIMEOUT, retry {}/{}", cmd_name, attempt + 1, retries);
-                        drop(mgr);
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                    } else {
-                        eprintln!("[CMD] {} -> TIMEOUT ({}s)", cmd_name, timeout.as_secs());
-                        return Err(format!("Command timeout: {}", cmd_name));
-                    }
-                }
-            }
-        }
-        unreachable!()
-    }
-
-    /// A caller that gives up must call `clear_events_collector`.
-    pub fn prepare_events_stream(
-        &mut self,
-    ) -> Result<mpsc::Receiver<Result<DeviceMessage, String>>, String> {
-        if self.events_collector.is_some() {
-            return Err("Event stream already in progress".to_string());
-        }
-        let port = self.port.as_mut().ok_or("Not connected")?;
-
-        let (tx, rx) = mpsc::channel();
-        self.events_collector = Some(tx);
-
-        let json = r#"{"cmd":"get_events"}"#;
-        port.write_all(format!("{}\n", json).as_bytes())
-            .map_err(|e| {
-                self.events_collector = None;
-                format!("Write failed: {}", e)
-            })?;
-        port.flush().map_err(|e| {
-            self.events_collector = None;
-            format!("Flush failed: {}", e)
-        })?;
-
-        Ok(rx)
-    }
-
-    pub fn clear_events_collector(&mut self) {
-        self.events_collector = None;
-    }
-
-    /// For commands whose payload doesn't fit SerialCommand (OTA, set_time).
-    pub fn prepare_raw_command(
+    fn prepare_command(
         &mut self,
         cmd_name: &str,
         json: &str,
-    ) -> Result<(u64, mpsc::Receiver<Result<DeviceMessage, String>>), String> {
-        let port = self.port.as_mut().ok_or("Not connected")?;
-
+    ) -> Result<(u64, mpsc::Receiver<Reply>), String> {
+        if self.port.is_none() {
+            return Err("Not connected".to_string());
+        }
         let cmd_id = self.next_cmd_id;
         self.next_cmd_id += 1;
 
         let (tx, rx) = mpsc::channel();
         self.cmd_queue.push_back((cmd_id, cmd_name.to_string(), tx));
-
-        port.write_all(format!("{}\n", json).as_bytes())
-            .map_err(|e| format!("Write failed: {}", e))?;
-        port.flush()
-            .map_err(|e| format!("Flush failed: {}", e))?;
-
+        if let Err(e) = self.write_line(json) {
+            self.cmd_queue.retain(|(id, _, _)| *id != cmd_id);
+            return Err(e);
+        }
         Ok((cmd_id, rx))
     }
 
-    pub fn send_raw_command_safe(
-        state: &Arc<Mutex<SerialManager>>,
-        cmd_name: &str,
-        json: &str,
-        timeout: std::time::Duration,
-    ) -> Result<DeviceMessage, String> {
-        Self::send_raw_command_safe_with_retries(state, cmd_name, json, timeout, 1)
-    }
-
-    pub fn send_raw_command_safe_with_retries(
+    /// Sends `json` and waits for the ack, err or time line answering `cmd_name`.
+    pub fn send(
         state: &Arc<Mutex<SerialManager>>,
         cmd_name: &str,
         json: &str,
@@ -712,20 +541,25 @@ impl SerialManager {
         retries: u32,
     ) -> Result<DeviceMessage, String> {
         for attempt in 0..=retries {
-            let (cmd_id, rx) = {
-                let mut mgr = lock_or_recover(state);
-                mgr.prepare_raw_command(cmd_name, json)?
+            // A booting device rejects writes with os error 121: retry.
+            let (cmd_id, rx) = match lock_or_recover(state).prepare_command(cmd_name, json) {
+                Ok(v) => v,
+                Err(e) if attempt < retries => {
+                    eprintln!("[CMD] {} -> WRITE_ERR ({}), retry {}/{}", cmd_name, e, attempt + 1, retries);
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
 
             match rx.recv_timeout(timeout) {
-                Ok(result) => return result,
+                Ok(Ok(Incoming::Reply(reply))) => return Ok(reply),
+                Ok(Ok(_)) => return Err(format!("Unexpected reply to {}", cmd_name)),
+                Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    let mut mgr = lock_or_recover(state);
-                    mgr.cmd_queue.retain(|(id, _, _)| *id != cmd_id);
-
+                    lock_or_recover(state).cmd_queue.retain(|(id, _, _)| *id != cmd_id);
                     if attempt < retries {
                         eprintln!("[CMD] {} -> TIMEOUT, retry {}/{}", cmd_name, attempt + 1, retries);
-                        drop(mgr);
                         std::thread::sleep(std::time::Duration::from_millis(200));
                     } else {
                         return Err(format!("Command timeout: {}", cmd_name));
@@ -734,6 +568,34 @@ impl SerialManager {
             }
         }
         unreachable!()
+    }
+
+    /// A caller that gives up must call `end_stream`.
+    pub fn start_stream(
+        &mut self,
+        cmd_name: &str,
+        json: &str,
+        drop_live_before_begin: bool,
+    ) -> Result<mpsc::Receiver<Reply>, String> {
+        if self.stream.is_some() {
+            return Err(STREAM_BUSY.to_string());
+        }
+        let (tx, rx) = mpsc::channel();
+        self.stream = Some(Stream {
+            cmd: cmd_name.to_string(),
+            tx,
+            begun: false,
+            drop_live_before_begin,
+        });
+        if let Err(e) = self.write_line(json) {
+            self.stream = None;
+            return Err(e);
+        }
+        Ok(rx)
+    }
+
+    pub fn end_stream(&mut self) {
+        self.stream = None;
     }
 
     pub fn disconnect(&mut self) {
@@ -742,8 +604,8 @@ impl SerialManager {
         }
         self.port = None;
         self.connected_path = None;
-        self.config = None;
-        self.drain_cmd_queue();
+        self.live_session_id = None;
+        self.drain_pending();
 
         // The reader checks stop_rx between short read timeouts, so join returns quickly.
         if let Some(handle) = self.reader_handle.take() {
@@ -756,17 +618,17 @@ impl SerialManager {
         self.stop_tx = None;
         self.port = None;
         self.connected_path = None;
-        self.drain_cmd_queue();
-        // Keep config and frames so the frontend can still show them.
+        self.live_session_id = None;
+        self.drain_pending();
     }
 
     /// Unblocks pending waiters with Err("Disconnected").
-    fn drain_cmd_queue(&mut self) {
+    fn drain_pending(&mut self) {
         while let Some((_, _, tx)) = self.cmd_queue.pop_front() {
             let _ = tx.send(Err("Disconnected".to_string()));
         }
-        if let Some(tx) = self.events_collector.take() {
-            let _ = tx.send(Err("Disconnected".to_string()));
+        if let Some(s) = self.stream.take() {
+            let _ = s.tx.send(Err("Disconnected".to_string()));
         }
     }
 }

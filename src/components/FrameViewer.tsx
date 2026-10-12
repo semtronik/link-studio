@@ -1,23 +1,30 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useSerialContext } from '../contexts/SerialContext';
 import { useFrameContext } from '../contexts/FrameContext';
+import { useToast } from '../contexts/ToastContext';
 import { useParser } from '../hooks/useParser';
 import { FrameTable } from './FrameTable';
 import { FrameTimeline } from './FrameTimeline';
 import { DetailPanel } from './DetailPanel';
 import { ParserSelector } from './ParserSelector';
 import { MetricsBanner } from './MetricsBanner';
-import type { FrameData } from '../hooks/useBackend';
+import { TransmitBar } from './TransmitBar';
 import type { DecodedFrame } from '../types/parser';
-import type { CaptureFile } from '../types/capture';
+import type { Frame } from '../types/journal';
+import { isDecodable, lineToFrame, linesToFrames, toJsonl } from '../utils/journal';
 import { save } from '@tauri-apps/plugin-dialog';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
 
+const BUTTON = 'px-3 py-1 rounded-element text-sm font-medium whitespace-nowrap transition-all duration-200';
+
 export function FrameViewer() {
-  const { connected, config, onFrame } = useSerialContext();
-  const { frames, paused, annotations, metrics, addFrame, replaceFrames, clearFrames, setPaused, setAnnotations, setMetrics } = useFrameContext();
+  const { connected, view, liveSessionId, onShow, onLine, showLive, newSession, transmit, getViewLines } = useSerialContext();
+  const { frames, paused, annotations, metrics, addFrame, replaceFrames, setPaused, setAnnotations, setMetrics } = useFrameContext();
+  const { addToast } = useToast();
   const { parserInfo, parserError, decodeFrame, analyzeFrames, importParser, loadRawParser } = useParser();
   const [selectedFrame, setSelectedFrame] = useState<DecodedFrame | null>(null);
+
+  const isLive = view?.kind === 'live' && connected;
 
   // Run analyze when frames change (debounced)
   useEffect(() => {
@@ -45,43 +52,44 @@ export function FrameViewer() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [frames, parserInfo?.hasAnalyze, analyzeFrames]);
 
-  const decodeAndAdd = useCallback(async (frame: FrameData) => {
-    const timestamp = frame.timestamp;
-
-    const decodedFrame: DecodedFrame = {
-      id: frame.id,
-      type: frame.type as 'frame',
-      hex: frame.hex,
-      timestamp,
-      rssi: frame.rssi ?? undefined,
-      snr: frame.snr ?? undefined,
-    };
-
+  const decode = useCallback(async (frame: Frame): Promise<DecodedFrame> => {
+    const decodedFrame: DecodedFrame = { ...frame };
+    if (!isDecodable(frame)) return decodedFrame;
     try {
-      const result = await decodeFrame(frame.id, frame.hex, {
-        timestamp,
-        rssi: frame.rssi ?? undefined,
-        snr: frame.snr ?? undefined,
+      decodedFrame.decoded = await decodeFrame(frame.id, frame.hex, {
+        timestamp: frame.timestamp,
+        rssi: frame.rssi,
+        snr: frame.snr,
       });
-      decodedFrame.decoded = result;
     } catch (err) {
       decodedFrame.decodeError = err instanceof Error ? err.message : String(err);
     }
+    return decodedFrame;
+  }, [decodeFrame]);
 
-    addFrame(decodedFrame);
-  }, [decodeFrame, addFrame]);
+  // Registered regardless of `connected`: the running session is read during connect.
+  useEffect(() => {
+    return onShow((lines) => {
+      setSelectedFrame(null);
+      setAnnotations({});
+      setMetrics([]);
+      Promise.all(linesToFrames(lines).map(decode)).then(replaceFrames);
+    });
+  }, [onShow, decode, replaceFrames, setAnnotations, setMetrics]);
+
+  // Back from the Device view: catch up on lines that arrived while unmounted.
+  useEffect(() => {
+    if (connected && view?.kind === 'live' && !paused) showLive();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
-    if (!connected || paused) return;
-
-    const unlisten = onFrame((frame) => {
-      decodeAndAdd(frame);
+    if (paused) return;
+    return onLine((line) => {
+      const frame = lineToFrame(line);
+      if (frame) decode(frame).then(addFrame);
     });
-
-    return () => {
-      unlisten?.();
-    };
-  }, [connected, paused, onFrame, decodeAndAdd]);
+  }, [paused, onLine, decode, addFrame]);
 
   // Re-decode all frames when parser changes
   useEffect(() => {
@@ -94,66 +102,71 @@ export function FrameViewer() {
 
     if (frames.length === 0) return;
 
-    const redecode = async () => {
-      const updated = await Promise.all(
-        frames.map(async (frame) => {
-          const decodedFrame: DecodedFrame = { ...frame, decoded: undefined, decodeError: undefined };
-          try {
-            const result = await decodeFrame(frame.id, frame.hex, {
-              timestamp: frame.timestamp,
-              rssi: frame.rssi,
-              snr: frame.snr,
-            });
-            decodedFrame.decoded = result;
-          } catch (err) {
-            decodedFrame.decodeError = err instanceof Error ? err.message : String(err);
-          }
-          return decodedFrame;
-        })
-      );
-      replaceFrames(updated);
-    };
-
-    redecode();
+    Promise.all(frames.map(f => decode({ ...f, decoded: undefined, decodeError: undefined } as DecodedFrame)))
+      .then(replaceFrames);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parserInfo, decodeFrame]);
 
-  const handleClear = () => {
-    clearFrames();
-    setSelectedFrame(null);
+  const togglePause = () => {
+    // Resuming catches up on what arrived meanwhile.
+    if (paused) showLive();
+    setPaused(!paused);
   };
+
+  const handleNewSession = async () => {
+    try {
+      await newSession();
+    } catch (err) {
+      addToast('error', 'New session failed', String(err));
+    }
+  };
+
+  const handleTransmit = useCallback(async (hex: string) => {
+    try {
+      await transmit(hex);
+      return true;
+    } catch (err) {
+      addToast('error', 'Transmission refused', String(err));
+      return false;
+    }
+  }, [transmit, addToast]);
 
   const handleExport = async () => {
+    const lines = getViewLines();
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, '0');
-    const defaultName = `capture_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.json`;
-
+    const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    const id = view?.kind === 'session' ? view.id : view?.kind === 'live' ? liveSessionId : null;
     const filePath = await save({
-      defaultPath: defaultName,
-      filters: [{ name: 'JSON', extensions: ['json'] }],
+      defaultPath: id != null ? `link-lr_session-${id}_${stamp}.jsonl` : `link-lr_${stamp}.jsonl`,
+      filters: [{ name: 'Link-LR recording', extensions: ['jsonl'] }],
     });
     if (!filePath) return;
-
-    const capture: CaptureFile = {
-      // Without config, a reloaded capture cannot recompute time on air.
-      config: config ?? undefined,
-      frames: frames.map(f => ({
-        timestamp: f.timestamp,
-        rssi: f.rssi,
-        snr: f.snr,
-        hex: f.hex,
-      })),
-    };
-    await writeTextFile(filePath, JSON.stringify(capture, null, 2));
+    await writeTextFile(filePath, toJsonl(lines));
   };
+
+  let title = 'Journal';
+  if (view?.kind === 'live') title = liveSessionId != null ? `Session ${liveSessionId} · live` : 'Live';
+  else if (view?.kind === 'session') title = `Session ${view.id}`;
+  else if (view?.kind === 'file') title = view.name;
 
   return (
     <div className="flex flex-col h-full gap-4">
       {/* `flex-wrap` + `whitespace-nowrap`: wrap whole blocks rather than squeeze labels. */}
       <div className="flex flex-wrap justify-between items-center gap-y-2 gap-x-4 flex-shrink-0">
-        <h2 className="text-[13px] font-medium text-text-secondary uppercase tracking-wider whitespace-nowrap">
-          Captured frames <span className="text-brand font-mono">({frames.length})</span>
-        </h2>
+        <div className="flex items-center gap-3 min-w-0">
+          <h2 className="text-[13px] font-medium text-text-secondary uppercase tracking-wider whitespace-nowrap truncate">
+            {title} <span className="text-brand font-mono">({frames.length})</span>
+          </h2>
+          {view?.kind === 'session' && connected && (
+            <button
+              onClick={() => { setPaused(false); showLive(); }}
+              className={`${BUTTON} bg-brand/10 text-brand hover:bg-brand/20`}
+            >
+              Back to live
+            </button>
+          )}
+        </div>
 
         <div className="flex flex-wrap items-center gap-3">
           <ParserSelector
@@ -166,28 +179,33 @@ export function FrameViewer() {
           <button
             onClick={handleExport}
             disabled={frames.length === 0}
-            className="px-3 py-1 rounded-element text-sm font-medium whitespace-nowrap transition-all duration-200 bg-overlay text-text-secondary hover:bg-brand/10 hover:text-brand disabled:opacity-40 disabled:cursor-not-allowed"
+            className={`${BUTTON} bg-overlay text-text-secondary hover:bg-brand/10 hover:text-brand disabled:opacity-40 disabled:cursor-not-allowed`}
           >
             Export
           </button>
 
-          <button
-            onClick={() => setPaused(!paused)}
-            className={`px-3 py-1 rounded-element text-sm font-medium whitespace-nowrap transition-all duration-200 ${
-              paused ? 'bg-rssi-good/20 text-rssi-good' : 'bg-overlay text-text-secondary'
-            }`}
-          >
-            {paused ? 'Resume' : 'Pause'}
-          </button>
+          {isLive && (
+            <>
+              <button
+                onClick={togglePause}
+                className={`${BUTTON} ${paused ? 'bg-rssi-good/20 text-rssi-good' : 'bg-overlay text-text-secondary'}`}
+              >
+                {paused ? 'Resume' : 'Pause'}
+              </button>
 
-          <button
-            onClick={handleClear}
-            className="px-3 py-1 bg-rssi-bad/10 text-rssi-bad rounded-element text-sm font-medium whitespace-nowrap hover:bg-rssi-bad/20 transition-all duration-200"
-          >
-            Clear
-          </button>
+              <button
+                onClick={handleNewSession}
+                title="Closes the running session on the device and starts a new one"
+                className={`${BUTTON} bg-rssi-bad/10 text-rssi-bad hover:bg-rssi-bad/20`}
+              >
+                New session
+              </button>
+            </>
+          )}
         </div>
       </div>
+
+      {isLive && <TransmitBar onTransmit={handleTransmit} />}
 
       {metrics.length > 0 && <MetricsBanner metrics={metrics} />}
 
@@ -206,16 +224,13 @@ export function FrameViewer() {
               frames={frames}
               selectedFrameId={selectedFrame?.id ?? null}
               onSelectFrame={setSelectedFrame}
-              sf={config?.sf}
-              bw={config?.bw}
             />
           </div>
 
           <DetailPanel
             frame={selectedFrame}
             annotation={selectedFrame ? annotations[selectedFrame.id] : undefined}
-            sf={config?.sf}
-            bw={config?.bw}
+            onReplay={isLive ? handleTransmit : undefined}
           />
         </div>
       </div>

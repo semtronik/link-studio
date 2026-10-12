@@ -1,14 +1,10 @@
 import { useRef, useEffect, useCallback, useMemo, useState } from 'react';
 import type { DecodedFrame } from '../types/parser';
-import { computeToaMs } from '../utils/loraToa';
 
 interface FrameTimelineProps {
   frames: DecodedFrame[];
   selectedFrameId: string | null;
   onSelectFrame: (frame: DecodedFrame) => void;
-  /* Unset until a device is connected: frames are then drawn at minimum width. */
-  sf?: number;
-  bw?: number;
 }
 
 /* Zoomed out, a ToA of a few tens of ms falls below one pixel. */
@@ -46,6 +42,7 @@ const COLOR_GOOD = '#4ADE80';
 const COLOR_MEDIUM = '#FBBF24';
 const COLOR_BAD = '#F87171';
 const COLOR_UNKNOWN = '#64748B';
+const COLOR_TX = '#A78BFA';
 
 function rssiColor(rssi?: number): string {
   if (rssi == null) return COLOR_UNKNOWN;
@@ -86,7 +83,7 @@ function formatDuration(ms: number): string {
   return `${(ms / 3_600_000).toFixed(1)}h`;
 }
 
-export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }: FrameTimelineProps) {
+export function FrameTimeline({ frames, selectedFrameId, onSelectFrame }: FrameTimelineProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
@@ -157,17 +154,19 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
     };
   }, []);
 
+  /* Frames with a time on air: received with a length, and our own transmissions. */
   const points = useMemo(() => {
     return frames
+      .filter(frame => frame.toaMs != null)
       .map(frame => {
         const bytes = frame.hex.length / 2;
-        const toaMs = sf && bw ? computeToaMs(bytes, sf, bw) : 0;
-        /* The timestamp marks the END of reception: the bar extends left. */
-        const t = frame.timestamp * 1000;
-        return { frame, t, tStart: t - toaMs, bytes, toaMs };
+        const toaMs = frame.toaMs!;
+        /* The timestamp marks the START of the frame: the bar extends right. */
+        const tStart = frame.timestamp * 1000;
+        return { frame, t: tStart + toaMs, tStart, bytes, toaMs };
       })
       .sort((a, b) => a.t - b.t);
-  }, [frames, sf, bw]);
+  }, [frames]);
 
   const bounds = useMemo(() => {
     if (points.length === 0) return null;
@@ -293,7 +292,10 @@ export function FrameTimeline({ frames, selectedFrameId, onSelectFrame, sf, bw }
       const h = usableH * (BAR_MIN_RATIO + ratio * (BAR_MAX_RATIO - BAR_MIN_RATIO));
       const isSelected = p.frame.id === selectedFrameId;
 
-      ctx.fillStyle = isSelected ? '#47ABFF' : rssiColor(p.frame.rssi);
+      ctx.fillStyle = isSelected ? '#47ABFF'
+        : p.frame.kind === 'tx' ? COLOR_TX
+        : p.frame.status === 'crc_err' ? COLOR_BAD
+        : rssiColor(p.frame.rssi);
       ctx.globalAlpha = isSelected ? 1 : 0.75;
       ctx.fillRect(x, baseline - h, w, h);
       ctx.globalAlpha = 1;

@@ -1,16 +1,8 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { useCallback, useRef, useState } from 'react';
+import type { Profile, RecordLine, SessionInfo } from '../types/recording';
+import { profileOf } from '../utils/journal';
 
-// Mirrors the Rust types (serde rename_all = camelCase).
-export interface LoRaConfig {
-  freq: number; sf: number; bw: number; drops: number;
-}
-export interface FrameData {
-  id: string; type: string; hex: string; timestamp: number; rssi: number | null; snr: number | null;
-}
-export interface FrameStats {
-  count: number; avgRssi: number | null; avgSnr: number | null;
-}
 export interface PortFirmwareInfo {
   kind: DeviceKind;
   product: string | null;
@@ -42,10 +34,15 @@ export interface FirmwareInfo {
 }
 
 export interface TimeSyncResult {
-  wasInSync: boolean;
   driftS: number;
   wasInvalid: boolean;
   didSync: boolean;
+}
+
+interface ConnectInfo {
+  firmware: FirmwareInfo;
+  profile: Profile;
+  clock: TimeSyncResult;
 }
 
 // Raw firmware line, e.g. "2026-04-15T14:32:09Z CHARGE_START pct=34"; parsed in DiagnosticCard.
@@ -55,59 +52,74 @@ export interface EventLogEntry {
 }
 
 type SerialEvent =
-  | { event: 'frame'; data: FrameData }
-  | { event: 'config'; data: LoRaConfig }
-  | { event: 'stats'; data: FrameStats }
-  | { event: 'firmware'; data: FirmwareInfo }
+  | { event: 'line'; data: RecordLine }
   | { event: 'disconnected' };
 
 export type DataSource = 'live' | 'replay' | null;
 
+/** What the journal shows: the running session, a past one, or a file. */
+export type JournalView =
+  | { kind: 'live' }
+  | { kind: 'session'; id: number }
+  | { kind: 'file'; name: string };
+
 export function useBackend() {
   const [connected, setConnected] = useState(false);
-  const [config, setConfig] = useState<LoRaConfig | null>(null);
-  const [stats, setStats] = useState<FrameStats>({ count: 0, avgRssi: null, avgSnr: null });
+  const [profile, setProfileState] = useState<Profile | null>(null);
   const [dataSource, setDataSource] = useState<DataSource>(null);
   const [currentPort, setCurrentPort] = useState<string | null>(null);
   const [firmware, setFirmware] = useState<FirmwareInfo | null>(null);
   const [loading, setLoading] = useState(false);
-  const frameCallbackRef = useRef<((frame: FrameData) => void) | null>(null);
+  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [liveSessionId, setLiveSessionId] = useState<number | null>(null);
+  const [view, setView] = useState<JournalView | null>(null);
+  /** Profile of what the journal shows, which is not the device's when viewing the past. */
+  const [viewProfile, setViewProfile] = useState<Profile | null>(null);
+
+  // The running session, kept whole whatever the journal shows.
+  const liveLinesRef = useRef<RecordLine[]>([]);
+  const viewLinesRef = useRef<RecordLine[]>([]);
+  const viewRef = useRef<JournalView | null>(null);
+  const showCallbackRef = useRef<((lines: RecordLine[]) => void) | null>(null);
+  const lineCallbackRef = useRef<((line: RecordLine) => void) | null>(null);
   const onDisconnectedRef = useRef<(() => void) | null>(null);
   // Held in a ref so the Channel is not garbage-collected.
   const channelRef = useRef<Channel<SerialEvent> | null>(null);
+
+  const show = useCallback((v: JournalView, lines: RecordLine[], p: Profile | null) => {
+    viewRef.current = v;
+    viewLinesRef.current = lines;
+    setView(v);
+    setViewProfile(p);
+    showCallbackRef.current?.(lines);
+  }, []);
+
+  const refreshSessions = useCallback(async () => {
+    const list = await invoke<SessionInfo[]>('get_sessions');
+    setSessions(list);
+    setLiveSessionId(list.find((s) => s.current)?.id ?? null);
+    return list;
+  }, []);
 
   const createChannel = useCallback((): Channel<SerialEvent> => {
     const channel = new Channel<SerialEvent>();
     channel.onmessage = (event) => {
       switch (event.event) {
-        case 'frame':
-          frameCallbackRef.current?.(event.data);
-          break;
-        case 'config':
-          setConfig(event.data);
-          break;
-        case 'stats':
-          setStats(event.data);
-          break;
-        case 'firmware':
-          setFirmware(event.data);
-          {
-            // Silent and fire-and-forget: a failure is logged, never shown.
-            const utc = Math.floor(Date.now() / 1000);
-            const offsetMin = -new Date().getTimezoneOffset();
-            invoke<TimeSyncResult>('sync_time', { utc, offsetMin })
-              .then((r) => {
-                if (r.didSync) {
-                  console.info(
-                    `[TIME] clock set (drift=${r.driftS.toFixed(1)}s, wasInvalid=${r.wasInvalid})`,
-                  );
-                } else {
-                  console.info(`[TIME] already on time (drift=${r.driftS.toFixed(1)}s)`);
-                }
-              })
-              .catch((e) => console.warn('[TIME] sync failed:', e));
+        case 'line': {
+          const line = event.data;
+          const live = viewRef.current?.kind === 'live';
+          if (line.type === 'session') {
+            liveLinesRef.current = [line];
+            setProfileState(line.profile);
+            setLiveSessionId(line.id);
+            refreshSessions().catch((e) => console.warn('[sessions]', e));
+            if (live) show({ kind: 'live' }, liveLinesRef.current, line.profile);
+          } else {
+            liveLinesRef.current.push(line);
+            if (live) lineCallbackRef.current?.(line);
           }
           break;
+        }
         case 'disconnected':
           setConnected(false);
           setCurrentPort(null);
@@ -119,26 +131,37 @@ export function useBackend() {
     };
     channelRef.current = channel;
     return channel;
-  }, []);
+  }, [refreshSessions, show]);
 
-  const connect = useCallback(async (portName: string): Promise<LoRaConfig> => {
+  const connect = useCallback(async (portName: string): Promise<void> => {
     setLoading(true);
     try {
       const channel = createChannel();
-
-      const cfg = await invoke<LoRaConfig>('serial_connect', {
+      const info = await invoke<ConnectInfo>('serial_connect', {
         portName,
+        utc: Math.floor(Date.now() / 1000),
+        offsetMin: -new Date().getTimezoneOffset(),
         onEvent: channel,
       });
+      if (info.clock.didSync) {
+        console.info(`[TIME] clock set (drift=${info.clock.driftS.toFixed(1)}s, wasInvalid=${info.clock.wasInvalid})`);
+      }
       setConnected(true);
       setCurrentPort(portName);
       setDataSource('live');
-      setConfig(cfg);
-      return cfg;
+      setFirmware(info.firmware);
+      setProfileState(info.profile);
+
+      const list = await refreshSessions();
+      const running = list.find((s) => s.current);
+      liveLinesRef.current = running
+        ? await invoke<RecordLine[]>('get_session', { id: running.id })
+        : [];
+      show({ kind: 'live' }, liveLinesRef.current, info.profile);
     } finally {
       setLoading(false);
     }
-  }, [createChannel]);
+  }, [createChannel, refreshSessions, show]);
 
   const disconnect = useCallback(async () => {
     try {
@@ -149,86 +172,92 @@ export function useBackend() {
     }
     channelRef.current = null;
     setConnected(false);
-    setConfig(null);
+    setProfileState(null);
     setCurrentPort(null);
     setDataSource(null);
     setFirmware(null);
-    setStats({ count: 0, avgRssi: null, avgSnr: null });
+    setSessions([]);
+    setLiveSessionId(null);
   }, []);
 
-  const applyConfig = useCallback(async (params: Partial<LoRaConfig>): Promise<LoRaConfig> => {
-    const cfg = await invoke<LoRaConfig>('apply_config', params);
-    setConfig(cfg);
-    return cfg;
+  const showLive = useCallback(() => {
+    show({ kind: 'live' }, liveLinesRef.current, profileOf(liveLinesRef.current) ?? profile);
+  }, [show, profile]);
+
+  const fetchSession = useCallback((id: number) => {
+    return invoke<RecordLine[]>('get_session', { id });
   }, []);
 
-  const sendCommand = useCallback(async (cmd: string, value?: number) => {
-    return invoke('send_command', { cmd, value });
-  }, []);
-
-  const getValidParams = useCallback(async () => {
-    return invoke<{ bandwidths: number[]; spreadingFactors: number[] }>('get_valid_params');
-  }, []);
-
-  const clearFrames = useCallback(async () => {
-    await invoke('clear_frames');
-    setStats({ count: 0, avgRssi: null, avgSnr: null });
-  }, []);
-
-  const loadCapture = useCallback(async (
-    captureConfig: LoRaConfig | null,
-    frames: any[],
-  ): Promise<FrameData[]> => {
-    setLoading(true);
-    try {
-      const result = await invoke<FrameData[]>('load_capture', { config: captureConfig, frames });
-      if (captureConfig) setConfig(captureConfig);
-      setDataSource('replay');
-      setCurrentPort(null);
-      return result;
-    } finally {
-      setLoading(false);
+  const openSession = useCallback(async (id: number) => {
+    if (id === liveSessionId) {
+      showLive();
+      return;
     }
+    const lines = await fetchSession(id);
+    show({ kind: 'session', id }, lines, profileOf(lines));
+  }, [liveSessionId, showLive, fetchSession, show]);
+
+  const loadFile = useCallback((name: string, lines: RecordLine[]) => {
+    setDataSource('replay');
+    setCurrentPort(null);
+    show({ kind: 'file', name }, lines, profileOf(lines));
+  }, [show]);
+
+  const closeView = useCallback(() => {
+    viewRef.current = null;
+    viewLinesRef.current = [];
+    setView(null);
+    setViewProfile(null);
+    setDataSource(null);
+    showCallbackRef.current?.([]);
   }, []);
 
-  const getFrames = useCallback(async (): Promise<FrameData[]> => {
-    return invoke<FrameData[]>('get_frames');
+  /** Only the fields given change; the device closes the session either way. */
+  const setProfile = useCallback(async (patch: Profile): Promise<Profile> => {
+    const p = await invoke<Profile>('set_profile', { profile: patch });
+    setProfileState(p);
+    return p;
   }, []);
 
-  const getStats = useCallback(async (): Promise<FrameStats> => {
-    return invoke<FrameStats>('get_stats');
+  /** Closes the running session; the device opens the next one at once. */
+  const newSession = useCallback(async () => {
+    await invoke<Profile>('set_profile', { profile: {} });
+  }, []);
+
+  const transmit = useCallback(async (hex: string) => {
+    await invoke('transmit', { hex });
   }, []);
 
   const getEvents = useCallback(async (): Promise<EventLogEntry[]> => {
     return invoke<EventLogEntry[]>('get_events');
   }, []);
 
-  const onFrame = useCallback((cb: (frame: FrameData) => void) => {
-    frameCallbackRef.current = cb;
-    return () => { frameCallbackRef.current = null; };
+  /** Lines currently shown, for export. */
+  const getViewLines = useCallback(() => viewLinesRef.current, []);
+
+  const onShow = useCallback((cb: (lines: RecordLine[]) => void) => {
+    showCallbackRef.current = cb;
+    return () => { showCallbackRef.current = null; };
+  }, []);
+
+  /** Live lines while the journal shows the running session. */
+  const onLine = useCallback((cb: (line: RecordLine) => void) => {
+    lineCallbackRef.current = cb;
+    return () => { lineCallbackRef.current = null; };
   }, []);
 
   const setOnDisconnected = useCallback((cb: (() => void) | null) => {
     onDisconnectedRef.current = cb;
   }, []);
 
-  const resetSource = useCallback(() => {
-    setDataSource(null);
-    setCurrentPort(null);
-    setConfig(null);
-    setStats({ count: 0, avgRssi: null, avgSnr: null });
-  }, []);
-
   return {
-    connected, config, stats,
+    connected, profile, viewProfile,
     dataSource, currentPort, firmware, loading,
+    sessions, liveSessionId, view,
     connect, disconnect,
-    applyConfig, sendCommand,
-    getValidParams,
-    clearFrames, loadCapture,
-    getFrames, getStats,
-    getEvents,
-    onFrame, setOnDisconnected,
-    resetSource,
+    setProfile, newSession, transmit,
+    refreshSessions, openSession, fetchSession, showLive, loadFile, closeView,
+    getViewLines, getEvents,
+    onShow, onLine, setOnDisconnected,
   };
 }

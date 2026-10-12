@@ -1,5 +1,4 @@
 import { createContext, useContext, useState, useCallback, type ReactNode } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import type { DecodedFrame, Annotation, Metric } from '../types/parser';
 
 interface FrameContextType {
@@ -24,7 +23,7 @@ export function FrameProvider({ children }: { children: ReactNode }) {
   const [metrics, setMetrics] = useState<Metric[]>([]);
 
   const addFrame = useCallback((frame: DecodedFrame) => {
-    setFrames(prev => [...prev, frame].slice(-500));
+    setFrames(prev => [...prev, frame]);
   }, []);
 
   const replaceFrames = useCallback((newFrames: DecodedFrame[]) => {
@@ -35,7 +34,6 @@ export function FrameProvider({ children }: { children: ReactNode }) {
     setFrames([]);
     setAnnotations({});
     setMetrics([]);
-    invoke('clear_frames').catch(() => {});
   }, []);
 
   return (

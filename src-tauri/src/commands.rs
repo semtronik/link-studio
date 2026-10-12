@@ -1,12 +1,21 @@
 use crate::firmware_manager;
 use crate::lora_protocol::*;
 use crate::port_scanner::{PortScanner, ScanPace};
-use crate::serial_manager::{ConnectError, SerialManager};
+use crate::serial_manager::{ConnectError, SerialManager, STREAM_BUSY};
 use crate::{log_error, log_info, log_warn};
+use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::ipc::Channel;
 use tauri::State;
-use uuid::Uuid;
+
+const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Silence allowed between two lines of a streamed reply.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// 4 MiB of recordings at ~250 bytes a line, with margin.
+const STREAM_MAX_LINES: usize = 100_000;
+/// Whole stream, and the wait for another one to finish. 4 MiB takes a few seconds.
+const STREAM_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Marks the port as connecting so the scanner won't probe it: two opens of
 /// the same COM port fail with os error 121 on Windows.
@@ -23,7 +32,7 @@ impl ConnectingGuard {
         // Windows releases the handle some time after Drop; the scanner holds
         // `probing_path` until it is really free.
         let waited = scanner
-            .wait_probe_clear(port_name, std::time::Duration::from_millis(3000));
+            .wait_probe_clear(port_name, Duration::from_millis(3000));
         if waited {
             log_info(&format!(
                 "serial_connect: waited for probe to finish on {}",
@@ -46,14 +55,91 @@ impl Drop for ConnectingGuard {
     }
 }
 
-/// std Mutex: never held across an await, and send_command_safe releases it
-/// before waiting for the reply.
+/// std Mutex: never held across an await, and SerialManager::send releases
+/// it before waiting for the reply.
 type SharedManager = Arc<Mutex<SerialManager>>;
 
 fn lock_mgr(state: &SharedManager) -> Result<std::sync::MutexGuard<'_, SerialManager>, String> {
     state
         .lock()
         .map_err(|_| "Mutex poisoned, restart the application".to_string())
+}
+
+/// Sync commands run on the main thread: anything that waits on the device
+/// goes through here so the window stays responsive.
+async fn blocking<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("Task panic: {}", e))?
+}
+
+fn send(state: &SharedManager, cmd: &str, payload: Value) -> Result<DeviceMessage, String> {
+    let reply = SerialManager::send(state, cmd, &payload.to_string(), REPLY_TIMEOUT, 0)?;
+    match reply {
+        DeviceMessage::Error { msg, .. } => Err(msg),
+        other => Ok(other),
+    }
+}
+
+/// Runs a streamed command and returns what came between `begin` and `end`.
+fn collect_stream(
+    state: &SharedManager,
+    cmd: &str,
+    payload: Value,
+    drop_live_before_begin: bool,
+) -> Result<Vec<Incoming>, String> {
+    // One stream at a time: wait for the one in flight rather than fail.
+    let waiting_since = Instant::now();
+    let rx = loop {
+        match lock_mgr(state)?.start_stream(cmd, &payload.to_string(), drop_live_before_begin) {
+            Ok(rx) => break rx,
+            Err(e) if e == STREAM_BUSY && waiting_since.elapsed() < STREAM_DEADLINE => {}
+            Err(e) => return Err(e),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let end_stream = || {
+        if let Ok(mut mgr) = state.lock() {
+            mgr.end_stream();
+        }
+    };
+
+    let started = Instant::now();
+    let mut items = Vec::new();
+    loop {
+        if started.elapsed() > STREAM_DEADLINE {
+            end_stream();
+            return Err(format!("{}: no end after {} s", cmd, STREAM_DEADLINE.as_secs()));
+        }
+        match rx.recv_timeout(STREAM_TIMEOUT) {
+            Ok(Ok(Incoming::Reply(DeviceMessage::Ack { phase, .. }))) => {
+                if phase.as_deref() == Some("end") {
+                    return Ok(items);
+                }
+            }
+            Ok(Ok(Incoming::Reply(DeviceMessage::Error { msg, .. }))) => return Err(msg),
+            Ok(Ok(item)) => {
+                items.push(item);
+                if items.len() >= STREAM_MAX_LINES {
+                    end_stream();
+                    return Err(format!("{}: more than {} lines", cmd, STREAM_MAX_LINES));
+                }
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                end_stream();
+                return Err(format!(
+                    "{}: nothing received for {} s",
+                    cmd,
+                    STREAM_TIMEOUT.as_secs()
+                ));
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -64,136 +150,115 @@ pub fn get_platform() -> &'static str {
     else { "other" }
 }
 
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeSyncResult {
+    /// |device - pc| in seconds; 0 if the device clock was invalid.
+    pub drift_s: f64,
+    /// Device reported valid=false (clock never set).
+    pub was_invalid: bool,
+    pub did_sync: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectInfo {
+    pub firmware: FirmwareInfo,
+    pub profile: Value,
+    pub clock: TimeSyncResult,
+}
+
+/// Opens the port, identifies a Link-LR, sets its clock and reads its profile.
+/// The sessions are read next by the frontend, then the live lines follow.
 #[tauri::command]
-pub fn serial_connect(
+pub async fn serial_connect(
     state: State<'_, SharedManager>,
     scanner: State<'_, Arc<PortScanner>>,
     port_name: String,
-    baud_rate: Option<u32>,
+    utc: i64,
+    offset_min: i32,
     on_event: Channel<SerialEvent>,
-) -> Result<LoRaConfig, ConnectError> {
-    let baud = baud_rate.unwrap_or(115200);
-    let state_clone = state.inner().clone();
+) -> Result<ConnectInfo, ConnectError> {
+    let state = state.inner().clone();
+    let scanner = scanner.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        connect_blocking(&state, &scanner, &port_name, utc, offset_min, on_event)
+    })
+    .await
+    .map_err(|e| ConnectError::Other {
+        port: String::new(),
+        raw: format!("Task panic: {}", e),
+    })?
+}
 
-    let _connecting_guard =
-        ConnectingGuard::new(state.inner().clone(), scanner.inner(), &port_name);
+fn connect_blocking(
+    state: &SharedManager,
+    scanner: &PortScanner,
+    port_name: &str,
+    utc: i64,
+    offset_min: i32,
+    on_event: Channel<SerialEvent>,
+) -> Result<ConnectInfo, ConnectError> {
+    let _connecting_guard = ConnectingGuard::new(state.clone(), scanner, port_name);
 
-    let other = |raw: String| ConnectError::Other {
-        port: port_name.clone(),
-        raw,
+    let fail = |step: &str, e: String| {
+        log_error(&format!("Connect failed port={}: {}: {}", port_name, step, e));
+        if let Ok(mut mgr) = state.lock() {
+            mgr.disconnect();
+        }
+        ConnectError::Other {
+            port: port_name.to_string(),
+            raw: format!("{}: {}", step, e),
+        }
     };
 
-    let event_channel = on_event.clone();
-
-    {
-        let mut mgr = lock_mgr(state.inner()).map_err(&other)?;
-        if let Err(e) = mgr.connect(&port_name, baud, on_event, state_clone) {
-            log_error(&format!("Connect failed port={}: {}", port_name, e));
-            return Err(e);
-        }
-    }
+    lock_mgr(state)
+        .map_err(|e| fail("lock", e))?
+        .connect(port_name, on_event, state.clone())
+        .inspect_err(|e| log_error(&format!("Connect failed port={}: {}", port_name, e)))?;
 
     // The Windows USB-serial driver may pulse DTR/RTS for ~100 ms after open;
     // a command sent earlier can be lost and time out.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(100));
 
-    // Six tries, 1 s apart: a device plugged in just before the click is
-    // still booting and refuses writes with os error 121.
-    let firmware_info = match identify(state.inner()) {
-        Ok(info) => info,
-        Err(e) => {
-            log_error(&format!("Connect failed port={}: get_version error: {}", port_name, e));
-            if let Ok(mut mgr) = state.inner().lock() {
-                mgr.disconnect();
-            }
-            return Err(other(format!("get_version: {}", e)));
-        }
-    };
-    if firmware_info.kind != DeviceKind::LinkLr {
+    let firmware = identify(state).map_err(|e| fail("get_version", e))?;
+    if firmware.kind != DeviceKind::LinkLr {
         log_warn(&format!(
             "Connect refused port={}: product={:?} model={:?}",
-            port_name, firmware_info.product, firmware_info.model
+            port_name, firmware.product, firmware.model
         ));
-        if let Ok(mut mgr) = state.inner().lock() {
+        if let Ok(mut mgr) = state.lock() {
             mgr.disconnect();
         }
         return Err(ConnectError::UnsupportedDevice {
-            port: port_name.clone(),
+            port: port_name.to_string(),
             raw: format!(
                 "{} {}",
-                firmware_info.product.as_deref().unwrap_or("?"),
-                firmware_info.model.as_deref().unwrap_or("?")
+                firmware.product.as_deref().unwrap_or("?"),
+                firmware.model.as_deref().unwrap_or("?")
             ),
-            kind: firmware_info.kind,
+            kind: firmware.kind,
         });
     }
-    let _ = event_channel.send(SerialEvent::Firmware(firmware_info.clone()));
+
+    // Before reading the sessions: set_time closes the running one.
+    let clock = sync_time(state, utc, offset_min).map_err(|e| fail("clock", e))?;
+    let profile = read_profile(state).map_err(|e| fail("get_profile", e))?;
+
     log_info(&format!(
         "Connect port={} OK model={} version={}",
         port_name,
-        firmware_info.model.as_deref().unwrap_or("?"),
-        firmware_info.version.as_deref().unwrap_or("?")
+        firmware.model.as_deref().unwrap_or("?"),
+        firmware.version.as_deref().unwrap_or("?")
     ));
-
-    let cmd = SerialCommand {
-        cmd: "get_config".to_string(),
-        value: None,
-    };
-    let resp = match SerialManager::send_command_safe(state.inner(), cmd) {
-        Ok(r) => r,
-        Err(e) => {
-            log_error(&format!("Connect failed port={}: get_config error: {}", port_name, e));
-            if let Ok(mut mgr) = state.inner().lock() {
-                mgr.disconnect();
-            }
-            return Err(other(format!("get_config: {}", e)));
-        }
-    };
-
-    let config = match resp {
-        DeviceMessage::Config {
-            freq,
-            sf,
-            bw,
-            drops,
-        } => {
-            let prev = LoRaConfig {
-                freq: 868.0,
-                sf: 7,
-                bw: 125.0,
-                drops: 0,
-            };
-            let config = LoRaConfig {
-                freq: freq.unwrap_or(prev.freq),
-                sf: sf.unwrap_or(prev.sf),
-                bw: bw.unwrap_or(prev.bw),
-                drops: drops.unwrap_or(prev.drops),
-            }.sanitized();
-            let mut mgr = lock_mgr(state.inner()).map_err(&other)?;
-            mgr.config = Some(config.clone());
-            drop(mgr);
-            config
-        }
-        _ => {
-            if let Ok(mut mgr) = state.inner().lock() {
-                mgr.disconnect();
-            }
-            return Err(other("get_config_unexpected_response".to_string()));
-        }
-    };
-
-    // The frontend calls `sync_time` on the Firmware event: the local
-    // offset is easier to read in JS.
-
-    Ok(config)
+    Ok(ConnectInfo { firmware, profile, clock })
 }
 
 fn identify(state: &SharedManager) -> Result<FirmwareInfo, String> {
-    let cmd = SerialCommand {
-        cmd: "get_version".to_string(),
-        value: None,
-    };
-    match SerialManager::send_command_safe_with_retries(state, cmd, 6)? {
+    // Six tries, 1 s apart: a device plugged in just before the click is
+    // still booting and refuses writes with os error 121.
+    let payload = json!({ "cmd": "get_version" }).to_string();
+    match SerialManager::send(state, "get_version", &payload, REPLY_TIMEOUT, 6)? {
         DeviceMessage::Ack {
             version,
             build_date,
@@ -209,98 +274,39 @@ fn identify(state: &SharedManager) -> Result<FirmwareInfo, String> {
             build_date,
             mac,
         }),
+        DeviceMessage::Error { msg, .. } => Err(msg),
         _ => Err("unexpected reply".to_string()),
     }
 }
 
-#[derive(serde::Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct TimeSyncResult {
-    /// Clock already valid and on time: no set_time sent.
-    pub was_in_sync: bool,
-    /// |device - pc| in seconds; 0 if the device clock was invalid.
-    pub drift_s: f64,
-    /// Device reported valid=false (RTC never set).
-    pub was_invalid: bool,
-    pub did_sync: bool,
-}
-
 /// Sets the device clock if it is invalid or drifts more than 30 s.
-/// Called by the frontend once the device is identified.
-#[tauri::command]
-pub fn sync_time(
-    state: State<'_, SharedManager>,
-    utc: i64,
-    offset_min: i32,
-) -> Result<TimeSyncResult, String> {
+fn sync_time(state: &SharedManager, utc: i64, offset_min: i32) -> Result<TimeSyncResult, String> {
     const DRIFT_THRESHOLD_S: f64 = 30.0;
 
-    let resp = SerialManager::send_command_safe(
-        state.inner(),
-        SerialCommand {
-            cmd: "get_time".to_string(),
-            value: None,
-        },
-    )?;
-
-    let (device_utc, device_valid) = match resp {
+    let (device_utc, valid) = match send(state, "get_time", json!({ "cmd": "get_time" }))? {
         DeviceMessage::Time { utc, valid, .. } => (utc, valid.unwrap_or(false)),
         _ => return Err("Unexpected reply to get_time".to_string()),
     };
+    let drift_s = if valid { (device_utc - utc as f64).abs() } else { 0.0 };
 
-    let drift_s = if device_valid {
-        (device_utc - utc as f64).abs()
-    } else {
-        0.0
-    };
-
-    let needs_sync = !device_valid || drift_s > DRIFT_THRESHOLD_S;
-    if !needs_sync {
-        log_info(&format!("Time already in sync (drift={:.1}s)", drift_s));
-        return Ok(TimeSyncResult {
-            was_in_sync: true,
-            drift_s,
-            was_invalid: false,
-            did_sync: false,
-        });
+    if valid && drift_s <= DRIFT_THRESHOLD_S {
+        return Ok(TimeSyncResult { drift_s, was_invalid: false, did_sync: false });
     }
 
-    // Raw JSON: SerialCommand carries a single value.
-    let set_time_json = serde_json::json!({
-        "cmd": "set_time",
-        "utc": utc,
-        "offset_min": offset_min,
-    })
-    .to_string();
-
-    let resp = SerialManager::send_raw_command_safe(
-        state.inner(),
+    send(
+        state,
         "set_time",
-        &set_time_json,
-        std::time::Duration::from_secs(3),
-    )?;
+        json!({ "cmd": "set_time", "utc": utc, "offset_min": offset_min }),
+    )
+    .map_err(|e| format!("set_time rejected: {}", e))?;
+    log_info(&format!("Clock set (drift={:.1}s, was_invalid={})", drift_s, !valid));
+    Ok(TimeSyncResult { drift_s, was_invalid: !valid, did_sync: true })
+}
 
-    match resp {
-        DeviceMessage::Ack { .. } => {
-            log_info(&format!(
-                "Time sync OK (drift={:.1}s, was_invalid={})",
-                drift_s, !device_valid
-            ));
-            Ok(TimeSyncResult {
-                was_in_sync: false,
-                drift_s,
-                was_invalid: !device_valid,
-                did_sync: true,
-            })
-        }
-        DeviceMessage::Error { msg, .. } => {
-            log_error(&format!("Time sync failed: {}", msg));
-            Err(format!("set_time rejected: {}", msg))
-        }
-        _ => {
-            log_error("Time sync: unexpected response");
-            Err("Unexpected reply to set_time".to_string())
-        }
+fn read_profile(state: &SharedManager) -> Result<Value, String> {
+    match send(state, "get_profile", json!({ "cmd": "get_profile" }))? {
+        DeviceMessage::Ack { profile: Some(p), .. } => Ok(p),
+        _ => Err("get_profile: no profile in reply".to_string()),
     }
 }
 
@@ -312,130 +318,107 @@ pub fn serial_disconnect(state: State<'_, SharedManager>) -> Result<(), String> 
     Ok(())
 }
 
-/// Coarse range check; the firmware does the real validation.
-fn validate_command_value(cmd: &str, value: Option<f64>) -> Result<(), String> {
-    let v = match value {
-        Some(v) => v,
-        None => return Ok(()),
-    };
+#[tauri::command]
+pub async fn get_profile(state: State<'_, SharedManager>) -> Result<Value, String> {
+    let state = state.inner().clone();
+    blocking(move || read_profile(&state)).await
+}
 
-    match cmd {
-        "set_freq" => {
-            if !(150.0..=960.0).contains(&v) {
-                return Err(format!("Frequency out of range (150-960 MHz): {}", v));
+/// `profile` holds only the fields to change; the device checks them all
+/// before applying any, and closes the session. Returns the profile as applied.
+#[tauri::command]
+pub async fn set_profile(state: State<'_, SharedManager>, profile: Value) -> Result<Value, String> {
+    let state = state.inner().clone();
+    blocking(move || {
+        let reply = send(&state, "set_profile", json!({ "cmd": "set_profile", "profile": profile }))
+            .inspect_err(|e| log_warn(&format!("set_profile rejected: {}", e)))?;
+        match reply {
+            DeviceMessage::Ack { profile: Some(p), .. } => {
+                log_info(&format!("set_profile OK {}", p));
+                Ok(p)
             }
+            _ => Err("set_profile: no profile in reply".to_string()),
         }
-        "set_sf" => {
-            let sf = v as u8;
-            if !SPREADING_FACTORS.contains(&sf) {
-                return Err(format!("Invalid SF (6-12): {}", v));
-            }
-        }
-        "set_bw" => {
-            if !VALID_BANDWIDTHS.contains(&v) {
-                return Err(format!("Invalid bandwidth: {}", v));
-            }
-        }
-        _ => {}
-    }
-    Ok(())
+    })
+    .await
+}
+
+/// Puts a frame on air. The outcome arrives later as a live `tx` line.
+#[tauri::command]
+pub async fn transmit(state: State<'_, SharedManager>, hex: String) -> Result<(), String> {
+    let state = state.inner().clone();
+    blocking(move || send(&state, "tx", json!({ "cmd": "tx", "value": hex })).map(|_| ())).await
+}
+
+/// `session_info` lines, oldest first.
+#[tauri::command]
+pub async fn get_sessions(state: State<'_, SharedManager>) -> Result<Vec<Value>, String> {
+    let state = state.inner().clone();
+    blocking(move || {
+        let infos: Vec<Value> = collect_stream(&state, "get_sessions", json!({ "cmd": "get_sessions" }), false)?
+            .into_iter()
+            .filter_map(|i| match i {
+                Incoming::SessionInfo(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        let current = infos
+            .iter()
+            .find(|v| v.get("current").and_then(|c| c.as_bool()) == Some(true))
+            .and_then(|v| v.get("id").and_then(|id| id.as_u64()));
+        lock_mgr(&state)?.set_live_session_id(current);
+        Ok(infos)
+    })
+    .await
+}
+
+/// A session's lines as recorded. For the running session, the live lines
+/// carry on from the last one returned, with no gap and no duplicate.
+#[tauri::command]
+pub async fn get_session(state: State<'_, SharedManager>, id: u64) -> Result<Vec<Value>, String> {
+    let state = state.inner().clone();
+    blocking(move || {
+        let running = lock_mgr(&state)?.live_session_id() == Some(id);
+        let lines = collect_stream(&state, "get_session", json!({ "cmd": "get_session", "id": id }), running)?
+            .into_iter()
+            .filter_map(|i| match i {
+                Incoming::Record(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        Ok(lines)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn send_command(
-    state: State<'_, SharedManager>,
-    cmd: String,
-    value: Option<f64>,
-) -> Result<serde_json::Value, String> {
-    if !VALID_COMMANDS.contains(&cmd.as_str()) {
-        return Err(format!("Command not exposed to the frontend: {}", cmd));
-    }
-    validate_command_value(&cmd, value)?;
-    let command = SerialCommand { cmd, value };
-    let response = SerialManager::send_command_safe(state.inner(), command)?;
-    serde_json::to_value(&response).map_err(|e| format!("Response serialization failed: {}", e))
+pub async fn erase_sessions(state: State<'_, SharedManager>) -> Result<(), String> {
+    let state = state.inner().clone();
+    blocking(move || {
+        send(&state, "erase_sessions", json!({ "cmd": "erase_sessions" }))?;
+        log_info("Recordings erased");
+        Ok(())
+    })
+    .await
 }
 
+/// The device's event log.
 #[tauri::command]
-pub fn apply_config(
-    state: State<'_, SharedManager>,
-    freq: Option<f64>,
-    sf: Option<u8>,
-    bw: Option<f64>,
-) -> Result<LoRaConfig, String> {
-    let current = {
-        let mgr = lock_mgr(state.inner())?;
-        mgr.config.clone().ok_or("No current config")?
-    };
-
-    let changes: Vec<SerialCommand> = [
-        freq.filter(|v| *v != current.freq).map(|v| SerialCommand {
-            cmd: "set_freq".to_string(),
-            value: Some(v),
-        }),
-        sf.filter(|v| *v != current.sf)
-            .map(|v| SerialCommand {
-                cmd: "set_sf".to_string(),
-                value: Some(v as f64),
-            }),
-        bw.filter(|v| *v != current.bw).map(|v| SerialCommand {
-            cmd: "set_bw".to_string(),
-            value: Some(v),
-        }),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-
-    if changes.is_empty() {
-        return Ok(current);
-    }
-
-    // On partial failure, re-read the config so the cache matches the device.
-    for cmd in &changes {
-        let value_str = cmd.value.map(|v| format!("{}", v)).unwrap_or_default();
-        let resp = match SerialManager::send_command_safe(state.inner(), cmd.clone()) {
-            Ok(r) => r,
-            Err(e) => {
-                log_error(&format!("{} {} failed: {}", cmd.cmd, value_str, e));
-                let _ = refresh_config_from_device(state.inner());
-                return Err(format!("{} error: {}", cmd.cmd, e));
-            }
-        };
-        if let DeviceMessage::Error { msg, .. } = resp {
-            log_warn(&format!("{} {} rejected: {}", cmd.cmd, value_str, msg));
-            let _ = refresh_config_from_device(state.inner());
-            return Err(format!("{} error: {}", cmd.cmd, msg));
-        }
-        log_info(&format!("{} {} OK", cmd.cmd, value_str));
-    }
-
-    let get_cmd = SerialCommand {
-        cmd: "get_config".to_string(),
-        value: None,
-    };
-    let resp = SerialManager::send_command_safe(state.inner(), get_cmd)?;
-
-    match resp {
-        DeviceMessage::Config {
-            freq,
-            sf,
-            bw,
-            drops,
-        } => {
-            let prev = current.clone();
-            let config = LoRaConfig {
-                freq: freq.unwrap_or(prev.freq),
-                sf: sf.unwrap_or(prev.sf),
-                bw: bw.unwrap_or(prev.bw),
-                drops: drops.unwrap_or(prev.drops),
-            }.sanitized();
-            let mut mgr = lock_mgr(state.inner())?;
-            mgr.config = Some(config.clone());
-            Ok(config)
-        }
-        _ => Ok(current),
-    }
+pub async fn get_events(state: State<'_, SharedManager>) -> Result<Vec<EventLogEntry>, String> {
+    let state = state.inner().clone();
+    blocking(move || {
+        let entries = collect_stream(&state, "get_events", json!({ "cmd": "get_events" }), false)?
+            .into_iter()
+            .filter_map(|i| match i {
+                Incoming::Reply(DeviceMessage::Event { line, seq }) => Some((line, seq)),
+                _ => None,
+            })
+            .enumerate()
+            .map(|(n, (line, seq))| EventLogEntry { line, seq: seq.unwrap_or(n as u32) })
+            .collect();
+        Ok(entries)
+    })
+    .await
 }
 
 // ============================================================
@@ -458,132 +441,23 @@ pub fn refresh_ports_now(scanner: State<'_, Arc<PortScanner>>) {
     scanner.trigger_refresh();
 }
 
-fn refresh_config_from_device(state: &SharedManager) {
-    if let Ok(DeviceMessage::Config {
-        freq,
-        sf,
-        bw,
-        drops,
-    }) = SerialManager::send_command_safe(
-        state,
-        SerialCommand {
-            cmd: "get_config".to_string(),
-            value: None,
-        },
-    ) {
-        if let Ok(mut mgr) = state.lock() {
-            let prev = mgr.config.clone().unwrap_or(LoRaConfig {
-                freq: 868.0,
-                sf: 7,
-                bw: 125.0,
-                drops: 0,
-            });
-            mgr.config = Some(LoRaConfig {
-                freq: freq.unwrap_or(prev.freq),
-                sf: sf.unwrap_or(prev.sf),
-                bw: bw.unwrap_or(prev.bw),
-                drops: drops.unwrap_or(prev.drops),
-            }.sanitized());
+// ============================================================
+// Firmware update
+// ============================================================
+
+#[tauri::command]
+pub async fn get_device_version(state: State<'_, SharedManager>) -> Result<Option<String>, String> {
+    let state = state.inner().clone();
+    blocking(move || {
+        if !lock_mgr(&state)?.is_connected() {
+            return Err("Not connected".to_string());
         }
-    }
-}
-
-#[tauri::command]
-pub fn get_config(state: State<'_, SharedManager>) -> Result<Option<LoRaConfig>, String> {
-    let mgr = lock_mgr(state.inner())?;
-    Ok(mgr.config.clone())
-}
-
-#[tauri::command]
-pub fn get_frames(state: State<'_, SharedManager>) -> Result<Vec<FrameData>, String> {
-    let mgr = lock_mgr(state.inner())?;
-    Ok(mgr.frame_store.frames())
-}
-
-#[tauri::command]
-pub fn get_stats(state: State<'_, SharedManager>) -> Result<FrameStats, String> {
-    let mgr = lock_mgr(state.inner())?;
-    Ok(mgr.frame_store.stats())
-}
-
-#[tauri::command]
-pub fn clear_frames(state: State<'_, SharedManager>) -> Result<(), String> {
-    let mut mgr = lock_mgr(state.inner())?;
-    mgr.frame_store.clear();
-    Ok(())
-}
-
-#[tauri::command]
-pub fn load_capture(
-    state: State<'_, SharedManager>,
-    config: Option<LoRaConfig>,
-    frames: Vec<serde_json::Value>,
-) -> Result<Vec<FrameData>, String> {
-    let mut mgr = lock_mgr(state.inner())?;
-
-    let frame_data: Vec<FrameData> = frames
-        .iter()
-        .map(|f| {
-            let ts_raw = f.get("timestamp").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            // Above 1e12 the timestamp is in ms.
-            let timestamp = if ts_raw > 1e12 {
-                ts_raw / 1000.0
-            } else {
-                ts_raw
-            };
-
-            FrameData {
-                id: Uuid::new_v4().to_string(),
-                frame_type: "frame".to_string(),
-                hex: f
-                    .get("hex")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                timestamp,
-                rssi: f.get("rssi").and_then(|v| v.as_f64()),
-                snr: f.get("snr").and_then(|v| v.as_f64()),
-            }
-        })
-        .collect();
-
-    mgr.frame_store.load(frame_data.clone());
-    mgr.config = config;
-
-    Ok(frame_data)
-}
-
-#[tauri::command]
-pub fn get_valid_params() -> serde_json::Value {
-    serde_json::json!({
-        "bandwidths": VALID_BANDWIDTHS,
-        "spreadingFactors": SPREADING_FACTORS,
+        match send(&state, "get_version", json!({ "cmd": "get_version" })) {
+            Ok(DeviceMessage::Ack { version, .. }) => Ok(version),
+            _ => Ok(None),
+        }
     })
-}
-
-// ============================================================
-// Firmware update commands
-// ============================================================
-
-#[tauri::command]
-pub fn get_device_version(
-    state: State<'_, SharedManager>,
-) -> Result<Option<String>, String> {
-    let is_connected = {
-        let mgr = lock_mgr(state.inner())?;
-        mgr.is_connected()
-    };
-    if !is_connected {
-        return Err("Not connected".to_string());
-    }
-    let cmd = SerialCommand {
-        cmd: "get_version".to_string(),
-        value: None,
-    };
-    match SerialManager::send_command_safe_with_retries(state.inner(), cmd, 1) {
-        Ok(DeviceMessage::Ack { version, .. }) => Ok(version),
-        _ => Ok(None),
-    }
+    .await
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -601,13 +475,8 @@ pub async fn flash_firmware(
     firmware_path: String,
     on_progress: Channel<FlashProgress>,
 ) -> Result<(), String> {
-    let state_arc = state.inner().clone();
-
-    tauri::async_runtime::spawn_blocking(move || {
-        flash_firmware_blocking(&state_arc, &firmware_path, &on_progress)
-    })
-    .await
-    .map_err(|e| format!("Flash task panic: {}", e))?
+    let state = state.inner().clone();
+    blocking(move || flash_firmware_blocking(&state, &firmware_path, &on_progress)).await
 }
 
 fn flash_firmware_blocking(
@@ -618,189 +487,50 @@ fn flash_firmware_blocking(
     use base64::Engine;
 
     let path = std::path::PathBuf::from(firmware_path);
-
-    // Read firmware binary
     let firmware_data = std::fs::read(&path)
         .map_err(|e| format!("Firmware read failed: {}", e))?;
     let total_size = firmware_data.len() as u64;
-
-    // Compute SHA256
     let sha256 = firmware_manager::compute_sha256(&path)?;
 
-    let timeout_short = std::time::Duration::from_secs(5);
-    let timeout_long = std::time::Duration::from_secs(10);
+    let timeout_short = Duration::from_secs(5);
+    let timeout_long = Duration::from_secs(10);
+    let progress = |status: &str, bytes_sent: u64| {
+        let _ = on_progress.send(FlashProgress {
+            status: status.to_string(),
+            bytes_sent,
+            total_bytes: total_size,
+            percent: bytes_sent as f64 / total_size as f64 * 100.0,
+        });
+    };
+    let send_ota = |cmd: &str, payload: Value, timeout: Duration, retries: u32| {
+        match SerialManager::send(state, cmd, &payload.to_string(), timeout, retries)? {
+            DeviceMessage::Error { msg, .. } => Err(format!("{} failed: {}", cmd, msg)),
+            _ => Ok(()),
+        }
+    };
 
-    // Phase 1: ota_begin
-    let _ = on_progress.send(FlashProgress {
-        status: "starting".to_string(),
-        bytes_sent: 0,
-        total_bytes: total_size,
-        percent: 0.0,
-    });
-
-    let begin_json = serde_json::json!({
-        "cmd": "ota_begin",
-        "size": total_size,
-        "sha256": sha256,
-    })
-    .to_string();
-
-    let resp = SerialManager::send_raw_command_safe_with_retries(
-        state,
+    progress("starting", 0);
+    send_ota(
         "ota_begin",
-        &begin_json,
+        json!({ "cmd": "ota_begin", "size": total_size, "sha256": sha256 }),
         timeout_long,
         1,
     )?;
 
-    if let DeviceMessage::Error { msg, .. } = resp {
-        return Err(format!("ota_begin failed: {}", msg));
-    }
-
-    // Phase 2: send chunks
-    let chunk_size: usize = 4096;
-    let b64_engine = base64::engine::general_purpose::STANDARD;
+    // 4 KiB of base64 stays under the device's 6 KiB line limit.
+    let b64 = base64::engine::general_purpose::STANDARD;
     let mut bytes_sent: u64 = 0;
-
-    for (seq, chunk) in firmware_data.chunks(chunk_size).enumerate() {
-        let b64_data = b64_engine.encode(chunk);
-
-        let data_json = serde_json::json!({
-            "cmd": "ota_data",
-            "seq": seq,
-            "data": b64_data,
-        })
-        .to_string();
-
-        let resp = SerialManager::send_raw_command_safe(
-            state,
-            "ota_data",
-            &data_json,
-            timeout_short,
-        )?;
-
-        if let DeviceMessage::Error { msg, .. } = resp {
-            return Err(format!("ota_data failed (chunk {}): {}", seq, msg));
-        }
-
+    for chunk in firmware_data.chunks(4096) {
+        send_ota("ota_data", json!({ "cmd": "ota_data", "data": b64.encode(chunk) }), timeout_short, 0)?;
         bytes_sent += chunk.len() as u64;
-        let percent = (bytes_sent as f64 / total_size as f64) * 100.0;
-
-        let _ = on_progress.send(FlashProgress {
-            status: "flashing".to_string(),
-            bytes_sent,
-            total_bytes: total_size,
-            percent,
-        });
+        progress("flashing", bytes_sent);
     }
 
-    // Phase 3: ota_end
-    let end_json = r#"{"cmd":"ota_end"}"#;
-    let resp = SerialManager::send_raw_command_safe(
-        state,
-        "ota_end",
-        end_json,
-        timeout_long,
-    )?;
+    send_ota("ota_end", json!({ "cmd": "ota_end" }), timeout_long, 0)?;
 
-    if let DeviceMessage::Error { msg, .. } = resp {
-        return Err(format!("ota_end failed: {}", msg));
-    }
-
-    // Phase 4: reboot
-    let _ = on_progress.send(FlashProgress {
-        status: "rebooting".to_string(),
-        bytes_sent: total_size,
-        total_bytes: total_size,
-        percent: 100.0,
-    });
-
-    let reboot_json = r#"{"cmd":"reboot"}"#;
-    let _ = SerialManager::send_raw_command_safe(
-        state,
-        "reboot",
-        reboot_json,
-        timeout_short,
-    );
-
-    let _ = on_progress.send(FlashProgress {
-        status: "done".to_string(),
-        bytes_sent: total_size,
-        total_bytes: total_size,
-        percent: 100.0,
-    });
+    progress("rebooting", total_size);
+    let _ = send_ota("reboot", json!({ "cmd": "reboot" }), timeout_short, 0);
+    progress("done", total_size);
 
     Ok(())
-}
-
-/// Reads the device log: ack phase=begin, N event lines, ack phase=end.
-/// The collector is cleared on any error so it can't block later commands.
-#[tauri::command]
-pub fn get_events(state: State<'_, SharedManager>) -> Result<Vec<EventLogEntry>, String> {
-    use std::time::Duration;
-    const INTER_MSG_TIMEOUT: Duration = Duration::from_secs(5);
-    const HARD_CAP_ENTRIES: usize = 5000; // runaway stream guard
-
-    let rx = {
-        let mut mgr = lock_mgr(state.inner())?;
-        mgr.prepare_events_stream()?
-    };
-
-    let mut entries: Vec<EventLogEntry> = Vec::new();
-    let mut got_begin = false;
-
-    fn cleanup_collector(state: &SharedManager) {
-        if let Ok(mut mgr) = state.lock() {
-            mgr.clear_events_collector();
-        }
-    }
-
-    loop {
-        match rx.recv_timeout(INTER_MSG_TIMEOUT) {
-            Ok(Ok(DeviceMessage::Ack { cmd, phase, .. })) if cmd == "get_events" => {
-                match phase.as_deref() {
-                    Some("begin") => {
-                        got_begin = true;
-                    }
-                    Some("end") => {
-                        // The dispatcher already cleared the collector.
-                        return Ok(entries);
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Ok(DeviceMessage::Event { line, seq })) => {
-                if !got_begin {
-                    eprintln!("[get_events] event received before begin ack");
-                }
-                entries.push(EventLogEntry {
-                    line,
-                    seq: seq.unwrap_or(entries.len() as u32),
-                });
-                if entries.len() >= HARD_CAP_ENTRIES {
-                    cleanup_collector(state.inner());
-                    return Err(format!(
-                        "Stream too long ({} events), firmware fault?",
-                        HARD_CAP_ENTRIES
-                    ));
-                }
-            }
-            Ok(Ok(DeviceMessage::Error { msg, .. })) => {
-                cleanup_collector(state.inner());
-                return Err(format!("Device rejected get_events: {}", msg));
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                cleanup_collector(state.inner());
-                return Err(format!("Stream interrupted: {}", e));
-            }
-            Err(_) => {
-                cleanup_collector(state.inner());
-                return Err(format!(
-                    "Event stream timeout (nothing received for {}s)",
-                    INTER_MSG_TIMEOUT.as_secs()
-                ));
-            }
-        }
-    }
 }

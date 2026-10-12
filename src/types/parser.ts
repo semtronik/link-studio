@@ -1,4 +1,4 @@
-import type { Frame } from './lora';
+import type { Frame } from './journal';
 
 // --- Parser contract ---
 

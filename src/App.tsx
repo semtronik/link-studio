@@ -4,24 +4,24 @@ import { getVersion } from '@tauri-apps/api/app';
 import { SerialProvider } from './contexts/SerialContext';
 import { useSerialContext } from './contexts/SerialContext';
 import { ToastProvider, useToast } from './contexts/ToastContext';
-import { FrameProvider, useFrameContext } from './contexts/FrameContext';
+import { FrameProvider } from './contexts/FrameContext';
 import { SourceSelector } from './components/SourceSelector';
-import { LoRaConfig } from './components/LoRaConfig';
-import { ConfigModal } from './components/ConfigModal';
+import { ProfileCard } from './components/ProfileCard';
+import { ProfileModal } from './components/ProfileModal';
+import { SessionsCard } from './components/SessionsCard';
 import { FrameViewer } from './components/FrameViewer';
 import { StatisticsCard } from './components/StatisticsCard';
 import { DeviceMenuButton } from './components/DeviceMenuButton';
 import { DeviceView } from './components/DeviceView';
 import { useTheme } from './hooks/useTheme';
 import type { PortInfo } from './hooks/useBackend';
-import type { CaptureFile } from './types/capture';
+import { parseJsonl } from './utils/journal';
 import { describeConnectError, type Platform } from './utils/connectError';
 import './App.css';
 
 function AppContent() {
   const { theme, toggleTheme } = useTheme();
-  const { connected, currentPort, config, loading, dataSource, connect, disconnect, applyConfig, loadCapture, setOnDisconnected, resetSource } = useSerialContext();
-  const { replaceFrames, clearFrames } = useFrameContext();
+  const { connected, currentPort, profile, viewProfile, view, loading, dataSource, connect, disconnect, setProfile, loadFile, closeView, setOnDisconnected } = useSerialContext();
   const { addToast } = useToast();
 
   const [configModalOpen, setConfigModalOpen] = useState(false);
@@ -61,8 +61,7 @@ function AppContent() {
       try { await disconnect(); } catch { /* ignore */ }
     }
     if (dataSource === 'replay') {
-      clearFrames();
-      resetSource();
+      closeView();
       setReplayFilename(null);
     }
 
@@ -79,41 +78,23 @@ function AppContent() {
       setConnecting(false);
       connectingPortRef.current = null;
     }
-  }, [connected, dataSource, connect, disconnect, clearFrames, resetSource, addToast, platform]);
+  }, [connected, dataSource, connect, disconnect, closeView, addToast, platform]);
 
   const handleLoadCapture = useCallback(async (file: File) => {
     if (connected) {
       try { await disconnect(); } catch { /* ignore */ }
     }
 
-    try {
-      const text = await file.text();
-      const data = JSON.parse(text) as CaptureFile;
-
-      if (!data.frames || !Array.isArray(data.frames)) {
-        addToast('error', 'Invalid file', 'Missing "frames" field');
-        return;
-      }
-
-      const frameData = await loadCapture(data.config ?? null, data.frames);
-
-      const decoded = frameData.map(f => ({
-        id: f.id,
-        type: f.type as 'frame',
-        hex: f.hex,
-        timestamp: f.timestamp,
-        rssi: f.rssi ?? undefined,
-        snr: f.snr ?? undefined,
-      }));
-
-      replaceFrames(decoded);
-      setReplayFilename(file.name);
-      setCurrentPortInfo(null);
-      addToast('success', 'Capture loaded', `${frameData.length} frame${frameData.length !== 1 ? 's' : ''} — ${file.name}`);
-    } catch {
-      addToast('error', 'Invalid file', 'Not valid JSON');
+    const lines = parseJsonl(await file.text());
+    if (lines.length === 0) {
+      addToast('error', 'Invalid file', 'No Link-LR recording lines found');
+      return;
     }
-  }, [connected, disconnect, loadCapture, replaceFrames, addToast]);
+    loadFile(file.name, lines);
+    setReplayFilename(file.name);
+    setCurrentPortInfo(null);
+    addToast('success', 'Recording opened', `${lines.length} line${lines.length !== 1 ? 's' : ''} — ${file.name}`);
+  }, [connected, disconnect, loadFile, addToast]);
 
   // Keeps frames; closing a replay clears them.
   const handleDisconnect = useCallback(async () => {
@@ -124,10 +105,9 @@ function AppContent() {
   }, [disconnect, addToast]);
 
   const handleCloseReplay = useCallback(() => {
-    clearFrames();
-    resetSource();
+    closeView();
     setReplayFilename(null);
-  }, [clearFrames, resetSource]);
+  }, [closeView]);
 
   const themeToggle = (
     <button
@@ -193,11 +173,12 @@ function AppContent() {
           <>
             {/* Sidebar */}
             <div className="w-[280px] bg-base border-r border-brand/8 overflow-y-auto p-4 space-y-4">
-              <LoRaConfig
-                config={config}
-                canModify={connected && dataSource === 'live'}
-                onOpenConfig={() => setConfigModalOpen(true)}
+              <ProfileCard
+                profile={viewProfile}
+                canModify={connected && view?.kind === 'live'}
+                onEdit={() => setConfigModalOpen(true)}
               />
+              <SessionsCard />
               <StatisticsCard />
             </div>
 
@@ -211,13 +192,12 @@ function AppContent() {
         )}
       </div>
 
-      {/* ConfigModal */}
-      {config && (
-        <ConfigModal
+      {profile && (
+        <ProfileModal
           open={configModalOpen}
           onClose={closeConfigModal}
-          config={config}
-          applyConfig={applyConfig}
+          profile={profile}
+          setProfile={setProfile}
         />
       )}
     </div>

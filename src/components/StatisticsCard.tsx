@@ -34,6 +34,19 @@ export function StatisticsCard() {
     return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
   }, [frames]);
 
+  /* Errors count as receptions: the radio started one (recording.md). */
+  const counts = useMemo(() => {
+    let ok = 0, errors = 0, sent = 0;
+    for (const f of frames) {
+      if (f.kind === 'tx') sent++;
+      else if (f.kind === 'rx') {
+        if (f.status === 'ok') ok++;
+        else errors++;
+      }
+    }
+    return { ok, errors, sent };
+  }, [frames]);
+
   /* Re-render every 10 s to refresh the "last frame" age. */
   const [tickNow, setTickNow] = useState(() => Date.now());
   useEffect(() => {
@@ -44,12 +57,12 @@ export function StatisticsCard() {
   if (frames.length === 0) {
     return (
       <div className="bg-surface rounded-card p-4 text-center text-text-muted border border-border text-[13px]">
-        Connect a device or load a capture to see statistics
+        Connect a device or open a recording to see statistics
       </div>
     );
   }
 
-  const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
+  const lastFrame = [...frames].reverse().find(f => f.kind === 'rx') ?? null;
   const lastFrameAge = lastFrame ? (tickNow / 1000) - lastFrame.timestamp : null;
   const lastFrameDisplay = lastFrameAge != null ? formatLastFrameAge(lastFrameAge) : null;
   const ageColorClass =
@@ -64,6 +77,19 @@ export function StatisticsCard() {
       </h2>
 
       <div className="divide-y divide-border/50">
+        <div className="flex justify-between items-center py-2">
+          <span className="text-[13px] text-text-secondary">Received</span>
+          <span className="font-mono text-[13px] text-text-primary">
+            {counts.ok}
+            {counts.errors > 0 && <span className="text-rssi-bad"> + {counts.errors} errors</span>}
+          </span>
+        </div>
+
+        <div className="flex justify-between items-center py-2">
+          <span className="text-[13px] text-text-secondary">Sent</span>
+          <span className="font-mono text-[13px] text-text-primary">{counts.sent}</span>
+        </div>
+
         <div className="flex justify-between items-center py-2">
           <span className="text-[13px] text-text-secondary">Avg RSSI</span>
           {avgRssi != null ? (
@@ -84,7 +110,7 @@ export function StatisticsCard() {
 
         {lastFrameDisplay && (
           <div className="flex justify-between items-center py-2">
-            <span className="text-[13px] text-text-secondary">Last frame</span>
+            <span className="text-[13px] text-text-secondary">Last reception</span>
             <span className={`text-[13px] ${ageColorClass}`}>
               {lastFrameDisplay.text}
             </span>

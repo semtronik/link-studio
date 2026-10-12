@@ -1,20 +1,44 @@
 import { useState, Fragment } from 'react';
 import { HexColorized } from './HexColorized';
-import { computeToaMs } from '../utils/loraToa';
+import { formatToa } from '../utils/journal';
 import type { DecodedFrame, Field, Annotation } from '../types/parser';
 
 interface DetailPanelProps {
   /* null still renders the panel, so the table never resizes on selection. */
   frame: DecodedFrame | null;
   annotation?: Annotation;
-  sf?: number;
-  bw?: number;
+  /** Set while the journal is live: puts the payload on air again. */
+  onReplay?: (hex: string) => void;
 }
 
-function formatToa(ms: number): string {
-  if (ms < 10) return `${ms.toFixed(2)} ms`;
-  if (ms < 1000) return `${ms.toFixed(1)} ms`;
-  return `${(ms / 1000).toFixed(2)} s`;
+const STATUS_TEXT: Record<string, string> = {
+  ok: 'Received',
+  crc_err: 'CRC error — payload corrupt',
+  header_err: 'Header error',
+  incomplete: 'Incomplete — header passed, frame did not follow',
+};
+
+/* Device measurements, in the order of recording.md; absent ones are skipped. */
+function measurements(frame: DecodedFrame): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  const line = frame.line;
+  if (line.type === 'rx') {
+    out.push(['Status', STATUS_TEXT[line.status] ?? line.status]);
+    if (line.rssi_dbm != null) out.push(['RSSI', `${line.rssi_dbm} dBm`]);
+    if (line.signal_dbm != null) out.push(['Signal', `${line.signal_dbm} dBm`]);
+    if (line.snr_db != null) out.push(['SNR', `${line.snr_db} dB`]);
+    if (line.noise_dbm != null) out.push(['Noise before', `${line.noise_dbm} dBm`]);
+    if (line.inst_min_dbm != null && line.inst_max_dbm != null) {
+      out.push(['During frame', `${line.inst_min_dbm} to ${line.inst_max_dbm} dBm (${line.inst_n ?? '?'} readings)`]);
+    }
+    if (line.freq_err_hz != null) out.push(['Frequency offset', `${line.freq_err_hz} Hz`]);
+    if (line.cr != null) out.push(['Coding rate', `4/${line.cr}`]);
+    if (line.crc_on != null) out.push(['CRC', line.crc_on ? 'on' : 'off']);
+  } else if (line.type === 'tx') {
+    out.push(['Transmission', line.result === 'ok' ? 'Sent' : line.result]);
+  }
+  if (frame.toaMs != null) out.push(['Time on air', formatToa(frame.toaMs)]);
+  return out;
 }
 
 const ANNOTATION_BADGE: Record<Annotation['status'], string> = {
@@ -65,7 +89,7 @@ function ParsedFieldsGrid({ fields, highlightedField, onHighlightField }: {
 const PANEL_CLASSES =
   'h-[260px] @[1140px]:h-auto @[1140px]:w-[40%] @[1140px]:min-w-[420px] @[1140px]:max-w-[640px] flex-shrink-0 overflow-y-auto bg-surface rounded-card border border-[rgba(255,255,255,0.04)] shadow-subtle p-4';
 
-export function DetailPanel({ frame, annotation, sf, bw }: DetailPanelProps) {
+export function DetailPanel({ frame, annotation, onReplay }: DetailPanelProps) {
   const [highlightedField, setHighlightedField] = useState<string | null>(null);
 
   if (!frame) {
@@ -97,24 +121,37 @@ export function DetailPanel({ frame, annotation, sf, bw }: DetailPanelProps) {
     >
       <div className="flex items-center gap-3 mb-2">
         <h3 className="text-[13px] font-medium text-text-secondary uppercase tracking-wider">
-          Frame detail — {formatTimestamp(frame.timestamp)}
+          {frame.kind === 'tx' ? 'Transmission' : 'Frame'} — {formatTimestamp(frame.timestamp)}
         </h3>
         {annotation && (
           <span className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-medium border ${ANNOTATION_BADGE[annotation.status]}`}>
             {annotation.label}
           </span>
         )}
+        {onReplay && byteCount > 0 && frame.status !== 'crc_err' && (
+          <button
+            onClick={() => onReplay(frame.hex)}
+            title="Transmit this payload again"
+            className="ml-auto px-3 py-1 rounded-element text-[12px] font-medium bg-brand/10 text-brand hover:bg-brand/20 transition-colors"
+          >
+            Send again
+          </button>
+        )}
       </div>
 
-      <div className="flex flex-wrap gap-x-4 gap-y-1 mb-3 font-mono text-[12px] text-text-muted">
-        <span>{byteCount} B</span>
-        {frame.rssi != null && <span>{frame.rssi} dBm</span>}
-        {frame.snr != null && <span>{frame.snr} dB</span>}
-        {sf && bw && (
-          <span title="Theoretical time on air (assumes CR 4/8, preamble 15)">
-            ToA {formatToa(computeToaMs(byteCount, sf, bw))}
-          </span>
+      <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 mb-3 text-[12px]">
+        {byteCount > 0 && (
+          <>
+            <span className="text-text-muted">Length</span>
+            <span className="font-mono text-text-secondary">{byteCount} B</span>
+          </>
         )}
+        {measurements(frame).map(([label, value]) => (
+          <Fragment key={label}>
+            <span className="text-text-muted">{label}</span>
+            <span className="font-mono text-text-secondary">{value}</span>
+          </Fragment>
+        ))}
       </div>
 
       {frame.decodeError && (
