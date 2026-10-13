@@ -57,7 +57,7 @@ function buildMessages(_platform: Platform): Record<ConnectErrorCode, (e: Connec
     unsupported_device: (e) => e.kind === 'lft'
       ? {
           title: 'LFT prototype',
-          detail: 'Link Studio drives Link devices only. Use lft-app 1.0.1 for the LFT prototype.',
+          detail: 'Link Studio drives Link devices only. Use lft-app 1.0.0 for the LFT prototype.',
         }
       : {
           title: 'Unsupported device',

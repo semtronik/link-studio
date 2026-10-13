@@ -161,7 +161,7 @@ export function SourceSelector({
     const fw = port.firmware;
     if (fw) {
       if (fw.kind === 'linkLr') return 'Link-LR';
-      if (fw.kind === 'lft') return 'LFT prototype — use lft-app 1.0.1';
+      if (fw.kind === 'lft') return 'LFT prototype — use lft-app 1.0.0';
       return [fw.product, fw.model].filter(Boolean).join(' ') || 'Unknown device';
     }
     const parts: string[] = [];

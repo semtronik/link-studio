@@ -10,7 +10,7 @@ First supported device: **Link-LR**, a LoRa traffic analyzer and generator
 its recordings are read at length, decoded and kept.
 
 > Using the **LFT prototype**? It is not supported by Link Studio. Use
-> [lft-app 1.0.1](https://github.com/semtronik/link-studio/releases/tag/v1.0.1),
+> [lft-app 1.0.0](https://github.com/semtronik/link-studio/releases/tag/v1.0.0),
 > its last compatible version.
 
 ## What it does
@@ -83,7 +83,7 @@ Stack: Tauri 2 (Rust) with React 19, TypeScript and Tailwind CSS.
 - Another application may hold the port (serial monitor, Arduino IDE…):
   the port list then says so. Close it.
 - A device showing as "LFT prototype" runs the prototype's firmware: use
-  lft-app 1.0.1.
+  lft-app 1.0.0.
 
 **Logs**
 
